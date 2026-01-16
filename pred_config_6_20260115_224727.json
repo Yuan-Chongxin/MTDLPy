@@ -1,0 +1,13 @@
+{
+  "original_file": "6.txt",
+  "original_path": "M:/sdzl/6.txt",
+  "prediction_file": "pred_6_20260115_224727.txt",
+  "prediction_path": "m:\\DLTool\\inversion/dl/results/pred_6_20260115_224727.txt",
+  "timestamp": "20260115_224727",
+  "data_dim": [
+    32,
+    32
+  ],
+  "model_type": "DinkNet",
+  "mt_mode": "TM"
+}
