@@ -31,6 +31,14 @@ The MTDLPy system adopts a three-tier architecture design:
 - **Real-time Monitoring**: Real-time monitoring of training process and loss curve display
 - **Multi-mode Support**: Support for TE mode, TM mode, and simultaneous processing of TE and TM modes
 
+## Pre-trained Model Download
+
+The pre-trained DinkNet model (optimized for MT data inversion) can be downloaded via the following link:
+- File name: DinkNet_best.pkl
+- Baidu Netdisk link: https://pan.baidu.com/s/1sCoV5IiYiNM4chC9h9ufIA 
+- Extraction code: MTDL
+
+
 ## Installation Guide
 
 ### Method 1: Manual Installation (Recommended)
