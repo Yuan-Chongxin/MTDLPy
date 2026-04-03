@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
+Utilities.
 
+Created July 2021.
 
-创建于2021年7月
-
-作者：袁崇鑫
+Author: Yuan Chongxin
 
 """
 import torch
@@ -189,7 +189,7 @@ def SSIM(img1, img2, window_size=11, size_average=True):
 
 
 def SaveTrainResults(train_loss, val_loss, SavePath, font2, font3):
-    """保存训练结果：仅保存损失数值到txt文件，不再单独保存损失函数曲线"""
+    """Write train/val loss vectors to txt under SavePath."""
     # 保存训练和验证损失到txt文件
     np.savetxt(SavePath + 'train_loss.txt', train_loss)
     np.savetxt(SavePath + 'val_loss.txt', val_loss)

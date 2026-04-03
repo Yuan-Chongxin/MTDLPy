@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-读取训练数据
+Load training data.
 
-创建于2021年7月
+Created July 2021.
 
-作者：ycx
+Author: ycx
 
 """
 
@@ -16,22 +16,118 @@ import pandas as pd
 from IPython.core.debugger import set_trace
 from scipy.interpolate import lagrange
 import os
+import math
 import cv2
+
+
+def _get_raw_grid_shape():
+    try:
+        from ParamConfig import RawGridShape as rgs
+        return rgs
+    except (ImportError, AttributeError):
+        return None
+
+
+def _get_raw_grid_transpose():
+    try:
+        from ParamConfig import RawGridTransposeBeforeResize as t
+        return bool(t)
+    except (ImportError, AttributeError):
+        return False
+
+
+def _infer_1d_grid_shape(length, target_hw, raw_hw=None):
+    """
+    When 1D length matches neither the target grid nor RawGridShape, infer (rows, cols) by factorization
+    so flattened 1D data can be reshaped to 2D then interpolated to DataDim/ModelDim.
+    Prefer raw_hw if product matches; else perfect square; else factor pair with aspect ratio closest to target.
+    """
+    th, tw = int(target_hw[0]), int(target_hw[1])
+    if length <= 0:
+        raise ValueError("Spatial data length is 0; cannot infer grid shape")
+    if raw_hw is not None:
+        rh, rw = int(raw_hw[0]), int(raw_hw[1])
+        if length == rh * rw:
+            return rh, rw
+    if length == th * tw:
+        return th, tw
+    s = int(math.isqrt(length))
+    if s * s == length:
+        return s, s
+    target_ar = (th / float(tw)) if tw > 0 else 1.0
+    best_h, best_w = None, None
+    best_score = float("inf")
+    for h in range(1, s + 1):
+        if length % h != 0:
+            continue
+        w = length // h
+        for hh, ww in ((h, w), (w, h)):
+            ar = hh / float(ww) if ww > 0 else 1.0
+            score = abs(math.log(ar + 1e-9) - math.log(target_ar + 1e-9))
+            if score < best_score:
+                best_score = score
+                best_h, best_w = hh, ww
+    if best_h is None:
+        raise ValueError(
+            "1D spatial data length %d cannot be factored into integer rows x cols; use multi-column text "
+            "(2D from np.loadtxt) or set ParamConfig RawGridShape=(rows,cols) with rows*cols=%d"
+            % (length, length)
+        )
+    return best_h, best_w
+
+
+def ensure_grid_shape(arr, target_hw, raw_hw=None):
+    """
+    Reshape apparent resistivity / phase / model grids to 2D (target_h, target_w) for .T and further steps.
+    target_hw is (rows, cols) like numpy shape; cv2.resize dsize is (cols, rows).
+    - 2D: any (h,w) is linearly interpolated to target; RawGridShape not required.
+    - 1D: reshape to target if length matches; else reshape using RawGridShape product if it matches;
+      else infer shape, reshape, then interpolate (shared by training and MT_test).
+    If RawGridTransposeBeforeResize is True and 2D shape equals raw_hw, transpose before resize.
+    Default (13,11) with flag True: (13,11) input is transposed to (11,13) then resized; labels at (11,13) skip that .T.
+    """
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    a = np.asarray(arr)
+    if a.ndim == 1:
+        need = target_h * target_w
+        if a.size == need:
+            a = a.reshape(target_h, target_w)
+        elif raw_hw is not None:
+            rh, rw = int(raw_hw[0]), int(raw_hw[1])
+            if a.size == rh * rw:
+                a = a.reshape(rh, rw)
+            else:
+                ih, iw = _infer_1d_grid_shape(a.size, target_hw, raw_hw=None)
+                a = a.reshape(ih, iw)
+        else:
+            ih, iw = _infer_1d_grid_shape(a.size, target_hw, raw_hw=None)
+            a = a.reshape(ih, iw)
+    elif a.ndim == 2:
+        pass
+    else:
+        raise ValueError("Expected 1D or 2D spatial data; got shape=%s" % (a.shape,))
+
+    if raw_hw is not None and _get_raw_grid_transpose():
+        rh, rw = int(raw_hw[0]), int(raw_hw[1])
+        if a.shape == (rh, rw):
+            a = np.ascontiguousarray(a.T)
+
+    if a.shape[0] != target_h or a.shape[1] != target_w:
+        a = cv2.resize(
+            np.ascontiguousarray(a, dtype=np.float32),
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    return np.asarray(a, dtype=np.float64)
+
 
 def validate_data(resistivity_data, phase_data, model_data, file_id, mode):
     """
-    校验视电阻率、相位和电阻率模型数据是否有效
-    
-    参数:
-    - resistivity_data: 视电阻率数据
-    - phase_data: 相位数据
-    - model_data: 电阻率模型数据
-    - file_id: 文件编号
-    - mode: 模式（'TE'或'TM'）
-    
-    返回:
-    - 布尔值：数据是否有效
-    - 列表：需要删除的文件路径
+    Validate apparent resistivity, phase, and resistivity model data.
+
+    Returns:
+    - valid: bool
+    - invalid_files: list of human-readable issue strings
     """
     invalid_files = []
     valid = True
@@ -39,17 +135,17 @@ def validate_data(resistivity_data, phase_data, model_data, file_id, mode):
     # 检查视电阻率数据是否有负数或异常值
     if np.any(np.logical_or(resistivity_data <= 0, resistivity_data >= 100000)):
         valid = False
-        invalid_files.append(f"{mode}视电阻率文件(ID: {file_id})包含负数或值异常")
+        invalid_files.append(f"{mode} apparent resistivity file (ID: {file_id}) has non-positive or out-of-range values")
         
     # 检查相位数据是否在0-90之间
     if np.any(phase_data < 0) or np.any(phase_data > 90):
         valid = False
-        invalid_files.append(f"{mode}相位文件(ID: {file_id})值不在0-90区间")
+        invalid_files.append(f"{mode} phase file (ID: {file_id}) has values outside [0, 90]")
         
     # 检查电阻率模型数据是否有负数或异常值
     if np.any(np.logical_or(model_data <= 0, model_data >= 100000)):
         valid = False
-        invalid_files.append(f"电阻率模型文件(ID: {file_id})包含负数或值异常")
+        invalid_files.append(f"Resistivity model file (ID: {file_id}) has non-positive or out-of-range values")
     
     return valid, invalid_files
 
@@ -58,35 +154,29 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                    TE_Resistivity_Dir, TE_Phase_Dir, TM_Resistivity_Dir, TM_Phase_Dir,
                   Resistivity_Model_Dir, MT_Mode):
     """
-    加载训练数据，支持TE、TM或Both模式，并对视电阻率、相位和电阻率模型进行校验
-    
-    参数:
-    - train_size: 训练数据大小
-    - in_channels: 输入通道数（2对应TE或TM模式，4对应Both模式）
-    - MT_Mode: MT模式（'TE'、'TM'或'Both'）
-    - 其他参数为数据路径和处理参数
-    
-    返回:
-    - train_set: 训练数据集
-    - label_set: 标签数据集
-    - data_dsp_dim: 数据降采样维度
-    - label_dsp_dim: 标签降采样维度
-    - valid_count: 有效的训练数据个数
+    Load training data for TE, TM, or Both; validate apparent resistivity, phase, and model.
+    Spatial pipeline: apparent data often (13,11), transpose inside ensure to (11,13), resize to data_dim, then training .T on inputs.
+    Labels: (11,13) without extra transpose, resize to model_dim; no second .T on labels in loader.
+
+    Returns train_set, label_set, data_dsp_dim, label_dsp_dim, valid_count.
     """
     import time
     start_time = time.time()
-    print(f"[DataLoad_Train] 开始加载训练数据，预计处理 {train_size} 个样本...")
+    print(f"[DataLoad_Train] Loading training data, up to {train_size} samples...")
     
     invalid_files_list = []
     valid_count = 0
-    
+    _raw_gs = _get_raw_grid_shape()
+    _th, _tw = int(data_dim[0]), int(data_dim[1])
+    _mh, _mw = int(model_dim[0]), int(model_dim[1])
+
     # 添加错误处理，确保函数在KeyboardInterrupt时也能提供有意义的信息
     try:
         if in_channels == 2 and MT_Mode == 'TE':
             for i in range(start, start + train_size):
                 # 每处理10个数据打印一次进度，方便监控
                 if (i - start) % 10 == 0 and (i - start) > 0:
-                    print(f"[DataLoad_Train] 已处理 {i - start} 个样本，有效数据: {valid_count}")
+                    print(f"[DataLoad_Train] Processed {i - start} samples, valid: {valid_count}")
                 
                 # 加载原始数据用于校验
                 # 确保目录路径以斜杠结尾
@@ -109,11 +199,11 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                 # 数据校验
                 is_valid, invalid_files = validate_data(raw_resistivity, raw_phase, raw_model, i, 'TE')
                 if is_valid:
-                    # 数据有效，继续处理
-                    train_data1 = np.reshape(raw_resistivity, (32, 32)).T
+                    # 数据有效，继续处理（任意原始网格先插值到 data_dim，与 ModelDim 一致）
+                    train_data1 = ensure_grid_shape(raw_resistivity, (_th, _tw), _raw_gs).T
                     train_data1 = np.log10(train_data1)
                     
-                    train_data2 = np.reshape(raw_phase, (32, 32)).T
+                    train_data2 = ensure_grid_shape(raw_phase, (_th, _tw), _raw_gs).T
                     
                     data1_set = np.array([train_data1, train_data2])
                     data1_set = np.transpose(data1_set, (1, 2, 0))
@@ -130,7 +220,7 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                         else:
                             data_set = np.append(data_set, data11_set, axis=0)
                     
-                    train_label1 = raw_model
+                    train_label1 = ensure_grid_shape(raw_model, (_mh, _mw), _raw_gs)
                     # 对电阻率label进行对数转换，保持与输入数据处理一致性
                     train_label1 = np.log10(train_label1)
                     train_label1 = block_reduce(train_label1, block_size=label_dsp_blk, func=np.max)
@@ -150,13 +240,13 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                 else:
                     # 数据无效，记录需要删除的文件
                     invalid_files_list.extend(invalid_files)
-                    print(f"跳过无效数据(ID: {i})")
+                    print(f"Skipping invalid sample (ID: {i})")
                     
         elif in_channels == 2 and MT_Mode == 'TM':
             for i in range(start, start + train_size):
                 # 每处理10个数据打印一次进度，方便监控
                 if (i - start) % 10 == 0 and (i - start) > 0:
-                    print(f"[DataLoad_Train] 已处理 {i - start} 个样本，有效数据: {valid_count}")
+                    print(f"[DataLoad_Train] Processed {i - start} samples, valid: {valid_count}")
                     
                 # 加载原始数据用于校验
                 # 确保目录路径以斜杠结尾
@@ -180,10 +270,10 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                 is_valid, invalid_files = validate_data(raw_resistivity, raw_phase, raw_model, i, 'TM')
                 if is_valid:
                     # 数据有效，继续处理
-                    train_data1 = np.reshape(raw_resistivity, (32, 32)).T
+                    train_data1 = ensure_grid_shape(raw_resistivity, (_th, _tw), _raw_gs).T
                     train_data1 = np.log10(train_data1)
                     
-                    train_data2 = np.reshape(raw_phase, (32, 32)).T
+                    train_data2 = ensure_grid_shape(raw_phase, (_th, _tw), _raw_gs).T
                     
                     data1_set = np.array([train_data1, train_data2])
                     data1_set = np.transpose(data1_set, (1, 2, 0))
@@ -201,7 +291,7 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                         else:
                             data_set = np.append(data_set, data11_set, axis=0)
                     
-                    train_label1 = raw_model
+                    train_label1 = ensure_grid_shape(raw_model, (_mh, _mw), _raw_gs)
                     # 对电阻率label进行对数转换，保持与输入数据处理一致性
                     train_label1 = np.log10(train_label1)
                     train_label1 = block_reduce(train_label1, block_size=label_dsp_blk, func=np.max)
@@ -219,12 +309,12 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                 else:
                     # 数据无效，记录需要删除的文件
                     invalid_files_list.extend(invalid_files)
-                    print(f"跳过无效数据(ID: {i})")
+                    print(f"Skipping invalid sample (ID: {i})")
         elif in_channels == 4:
             for i in range(start, start + train_size):
                 # 每处理10个数据打印一次进度，方便监控
                 if (i - start) % 10 == 0 and (i - start) > 0:
-                    print(f"[DataLoad_Train] 已处理 {i - start} 个样本，有效数据: {valid_count}")
+                    print(f"[DataLoad_Train] Processed {i - start} samples, valid: {valid_count}")
                     
                 # 加载原始数据用于校验
                 # 确保目录路径以斜杠结尾
@@ -260,15 +350,15 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                 
                 if te_valid and tm_valid:
                     # 数据有效，继续处理
-                    train_data1 = np.reshape(raw_te_resistivity, (32, 32)).T
+                    train_data1 = ensure_grid_shape(raw_te_resistivity, (_th, _tw), _raw_gs).T
                     train_data1 = np.log10(train_data1)
                     
-                    train_data2 = np.reshape(raw_te_phase, (32, 32)).T
+                    train_data2 = ensure_grid_shape(raw_te_phase, (_th, _tw), _raw_gs).T
                     
-                    train_data3 = np.reshape(raw_tm_resistivity, (32, 32)).T
+                    train_data3 = ensure_grid_shape(raw_tm_resistivity, (_th, _tw), _raw_gs).T
                     train_data3 = np.log10(train_data3)
                     
-                    train_data4 = np.reshape(raw_tm_phase, (32, 32)).T
+                    train_data4 = ensure_grid_shape(raw_tm_phase, (_th, _tw), _raw_gs).T
                     
                     data1_set = np.array([train_data1, train_data2, train_data3, train_data4])
                     data1_set = np.transpose(data1_set, (1, 2, 0))
@@ -286,7 +376,7 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                         else:
                             data_set = np.append(data_set, data11_set, axis=0)
                     
-                    train_label1 = raw_model
+                    train_label1 = ensure_grid_shape(raw_model, (_mh, _mw), _raw_gs)
                     # 对电阻率label进行对数转换，保持与输入数据处理一致性
                     train_label1 = np.log10(train_label1)
                     train_label1 = block_reduce(train_label1, block_size=label_dsp_blk, func=np.max)
@@ -307,64 +397,59 @@ def DataLoad_Train(train_size, train_data_dir, data_dim, in_channels, model_dim,
                         invalid_files_list.extend(te_invalid_files)
                     if not tm_valid:
                         invalid_files_list.extend(tm_invalid_files)
-                    print(f"跳过无效数据(ID: {i})")
+                    print(f"Skipping invalid sample (ID: {i})")
         
         # 如果valid_count为0，说明没有有效的训练数据，抛出异常
         if valid_count == 0:
-            raise ValueError("没有有效的训练数据，请检查数据文件质量")
+            raise ValueError("No valid training samples; check data files")
         
-        print(f"正在调整数据集形状...")
+        print(f"Reshaping dataset...")
         # 调整train_set的形状为有效的训练数据个数
         train_set = train_set.reshape((valid_count, in_channels, data_dsp_dim[0] * data_dsp_dim[1]))
         label_set = label_set.reshape((valid_count, 1, label_dsp_dim[0] * label_dsp_dim[1]))
         
-        print(f"数据集形状调整完成")
-        print(f"训练集形状: {train_set.shape}")
-        print(f"标签集形状: {label_set.shape}")
-        print(f"数据加载耗时: {time.time() - start_time:.2f} 秒")
+        print(f"Reshape done")
+        print(f"train_set shape: {train_set.shape}")
+        print(f"label_set shape: {label_set.shape}")
+        print(f"Load time: {time.time() - start_time:.2f} s")
         
         # 打印校验结果
-        print(f"\n数据校验完成:")
-        print(f"原始训练数据个数: {train_size}")
-        print(f"有效训练数据个数: {valid_count}")
-        print(f"无效数据个数: {train_size - valid_count}")
+        print(f"\nValidation summary:")
+        print(f"Requested samples: {train_size}")
+        print(f"Valid samples: {valid_count}")
+        print(f"Invalid samples: {train_size - valid_count}")
         
         if invalid_files_list:
-            print(f"\n无效文件列表:")
+            print(f"\nInvalid entries:")
             for file_info in invalid_files_list:
                 print(f"- {file_info}")
         else:
-            print("所有数据文件均有效")
+            print("All loaded files passed validation")
 
         # 根据用户要求，不返回归一化相关参数，只返回5个必要参数
         return train_set, label_set, data_dsp_dim, label_dsp_dim, valid_count
         
     except KeyboardInterrupt:
-        print(f"\n[DataLoad_Train] 数据加载被用户中断!")
-        print(f"已处理 {i - start + 1}/{train_size} 个样本")
-        print(f"已加载 {valid_count} 个有效数据")
+        print(f"\n[DataLoad_Train] Load interrupted by user")
+        print(f"Processed {i - start + 1}/{train_size} samples")
+        print(f"Valid samples loaded: {valid_count}")
         raise
     except Exception as e:
-        print(f"\n[DataLoad_Train] 数据加载出错: {str(e)}")
+        print(f"\n[DataLoad_Train] Load error: {str(e)}")
         raise
 
 
 # 改进的降采样函数，直接返回块的平均值
 def decimate(a, axis):
     """
-    简化的降采样函数，直接返回块的平均值
-    这比原来的实现更可靠，适用于block_reduce函数
+    Block mean for downsampling; used with block_reduce.
     """
     return np.mean(a, axis=axis)
 
 
 def updateFile(file, old_str, new_str):
     """
-    将替换的字符串写到一个新的文件中，然后将原文件删除，新文件改为原来文件的名字
-    :param file: 文件路径
-    :param old_str: 需要替换的字符串
-    :param new_str: 替换的字符串
-    :return: None
+    Write lines with old_str replaced to a .bak file, remove original, rename .bak to file.
     """
     with open(file, "r", encoding="utf-8") as f1, open("%s.bak" % file, "w", encoding="utf-8") as f2:
         for line in f1:
@@ -376,33 +461,15 @@ def updateFile(file, old_str, new_str):
 
 
 def normalize_data(data, min_val, max_val):
-    """标准化数据到[0,1]区间
-    
-    参数:
-    - data: 输入数据
-    - min_val: 最小值
-    - max_val: 最大值
-    
-    返回:
-    - 标准化后的数据
-    """
+    """Scale data to [0, 1] using min_val and max_val."""
     return (data - min_val) / (max_val - min_val)
 
 def denormalize_data(data, min_val, max_val):
-    """反标准化数据
-    
-    参数:
-    - data: 标准化后的数据
-    - min_val: 原始最小值
-    - max_val: 原始最大值
-    
-    返回:
-    - 反标准化后的数据
-    """
+    """Inverse of normalize_data."""
     return data * (max_val - min_val) + min_val
 
 def get_normal_data(data1):
-    """简单归一化函数，保留用于兼容性"""
+    """Simple normalization helper (legacy)."""
     amin = 0.1
     amax = 1000000
     return normalize_data(data1, amin, amax)
