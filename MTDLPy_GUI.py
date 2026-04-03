@@ -38,7 +38,7 @@ from ml_trainer import MTTrainer
 
 # 导入配置模块
 try:
-    from ParamConfig import ReUse
+    from ParamConfig import ReUse, DataDim, RawGridShape
     from PathConfig import models_dir, premodelname, results_dir
     CONFIG_MODULES_AVAILABLE = True
 except ImportError as e:
@@ -48,6 +48,272 @@ except ImportError as e:
     premodelname = ""
     models_dir = "./models/"
     results_dir = "./results/"
+    DataDim = [32, 32]
+    RawGridShape = (13, 11)
+
+
+def _ensure_data_dim_grid(arr):
+    """Interpolate to DataDim using ensure_grid_shape with RawGridShape. Does not apply the post-ensure .T used for apparent resistivity/phase in training and MT_test."""
+    from func.DataLoad_Train import ensure_grid_shape, _get_raw_grid_shape
+
+    th, tw = int(DataDim[0]), int(DataDim[1])
+    return ensure_grid_shape(arr, (th, tw), _get_raw_grid_shape())
+
+
+_QT_USER_ROLE = 256  # Qt.UserRole，避免模块顶层依赖 PyQt
+
+
+def _qlist_user_row(lst):
+    try:
+        if lst is not None and lst.currentItem():
+            return int(lst.row(lst.currentItem()))
+    except Exception:
+        pass
+    return None
+
+
+def _qlist_path_at_row(lst, row):
+    if lst is None or row is None or row < 0 or lst.count() <= row:
+        return None
+    try:
+        it = lst.item(row)
+        if not it:
+            return None
+        return it.data(_QT_USER_ROLE)
+    except Exception:
+        return None
+
+
+def _qlist_find_path_by_basename(lst, basename):
+    if not basename or lst is None:
+        return None
+    try:
+        for i in range(lst.count()):
+            it = lst.item(i)
+            if not it:
+                continue
+            p = it.data(_QT_USER_ROLE)
+            if p and os.path.basename(str(p)) == basename:
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _both_mode_resolve_te_tm_paths(te_res_list, te_ph_list, tm_res_list, tm_ph_list, extra_lists_for_idx=()):
+    """
+    In Both mode, align list row indices so TM phase is not taken from a stale TE-only row (avoid out-of-range / missing plots).
+    Prefer current row for apparent resistivity, else row 0; phase uses same row, then basename match against resistivity / other phase, else row 0.
+    """
+    idx = 0
+    for lst in (te_res_list, te_ph_list, tm_res_list, tm_ph_list) + tuple(extra_lists_for_idx):
+        r = _qlist_user_row(lst)
+        if r is not None:
+            idx = r
+            break
+
+    def _resolve_phase(ph_list, basename_refs):
+        p = _qlist_path_at_row(ph_list, idx)
+        if p:
+            return p
+        for bn in basename_refs:
+            if bn:
+                p2 = _qlist_find_path_by_basename(ph_list, bn)
+                if p2:
+                    return p2
+        return _qlist_path_at_row(ph_list, 0)
+
+    te_res_path = _qlist_path_at_row(te_res_list, idx) or _qlist_path_at_row(te_res_list, 0)
+    tm_res_path = _qlist_path_at_row(tm_res_list, idx) or _qlist_path_at_row(tm_res_list, 0)
+    te_b = os.path.basename(te_res_path) if te_res_path else None
+    tm_b = os.path.basename(tm_res_path) if tm_res_path else None
+    te_ph_path = _resolve_phase(te_ph_list, [te_b, tm_b])
+    tm_ph_path = _resolve_phase(
+        tm_ph_list,
+        [
+            os.path.basename(te_ph_path) if te_ph_path else None,
+            te_b,
+            tm_b,
+        ],
+    )
+    return idx, te_res_path, te_ph_path, tm_res_path, tm_ph_path
+
+
+def _draw_geophysical_section(ax, data, length_km, depth_km, cmap='jet_r', num_ticks=5):
+    """
+    Draw 2D section in physical km: data fills [0,length]×[0,depth], avoiding excess blank from pixel coords + aspect.
+    origin='upper': first row is depth 0 (top).
+    """
+    length_km = float(length_km)
+    depth_km = float(depth_km)
+    extent = (0.0, length_km, depth_km, 0.0)
+    im = ax.imshow(
+        np.asarray(data),
+        cmap=cmap,
+        origin='upper',
+        extent=extent,
+        interpolation='nearest',
+    )
+    ax.set_xlim(0.0, length_km)
+    ax.set_ylim(depth_km, 0.0)
+    ax.set_aspect('equal', adjustable='box')
+    xt = np.linspace(0.0, length_km, num_ticks)
+    yt = np.linspace(0.0, depth_km, num_ticks)
+    ax.set_xticks(xt)
+    ax.set_yticks(yt)
+    ax.set_xticklabels([f"{x:.1f}" for x in xt])
+    ax.set_yticklabels([f"{y:.1f}" for y in yt])
+    ax.set_xlabel('Length (km)')
+    ax.set_ylabel('Depth (km)')
+    return im
+
+
+def _create_axes_for_plot_count(fig, n):
+    """
+    Create axes by subplot count; avoids phase axes being clipped when a 2×2 bottom spans two columns with colorbars/tight_layout.
+    n=3: model top-left, apparent resistivity top-right, phase bottom-right (bottom-left empty).
+    n=5: first five cells of a 2×3 grid (Both: model + TE/TM apparent resistivity + TE/TM phase).
+    """
+    fig.clear()
+    if n == 1:
+        fig.set_size_inches(6.6, 4.6)
+        return [fig.add_subplot(111)]
+    if n == 2:
+        fig.set_size_inches(11.0, 4.6)
+        return [fig.add_subplot(1, 2, 1), fig.add_subplot(1, 2, 2)]
+    if n == 3:
+        fig.set_size_inches(14.5, 7.2)
+        return [
+            fig.add_subplot(2, 2, 1),
+            fig.add_subplot(2, 2, 2),
+            fig.add_subplot(2, 2, 4),
+        ]
+    if n == 4:
+        fig.set_size_inches(13.5, 7.0)
+        return [
+            fig.add_subplot(2, 2, 1),
+            fig.add_subplot(2, 2, 2),
+            fig.add_subplot(2, 2, 3),
+            fig.add_subplot(2, 2, 4),
+        ]
+    if n == 5:
+        fig.set_size_inches(19.5, 8.6)
+        return [fig.add_subplot(2, 3, i) for i in range(1, 6)]
+    fig.set_size_inches(10, 6)
+    return [fig.add_subplot(1, n, i + 1) for i in range(n)]
+
+
+def _finalize_figure_layout(fig, n_plots):
+    """For multiple subplots, skip tight_layout (clips bottom x-axis) and use fixed margins."""
+    if n_plots == 1:
+        fig.subplots_adjust(left=0.12, right=0.86, top=0.88, bottom=0.22)
+    elif n_plots == 2:
+        fig.subplots_adjust(left=0.10, right=0.78, top=0.86, bottom=0.22, wspace=0.45)
+    elif n_plots == 3:
+        # wspace 过大两列会“拉开”；right 需为右侧色条+单位留出空白，避免裁字
+        fig.subplots_adjust(
+            left=0.085, right=0.88, top=0.88, bottom=0.14, hspace=0.50, wspace=0.32
+        )
+    elif n_plots == 4:
+        fig.subplots_adjust(
+            left=0.075, right=0.88, top=0.90, bottom=0.12, hspace=0.50, wspace=0.26
+        )
+    elif n_plots >= 5:
+        fig.subplots_adjust(
+            left=0.055, right=0.86, top=0.86, bottom=0.12, hspace=0.50, wspace=0.38
+        )
+    else:
+        fig.subplots_adjust(
+            left=0.055, right=0.96, top=0.93, bottom=0.10, hspace=0.52, wspace=0.45
+        )
+
+
+def _geophys_colorbar_kwargs(n_plots):
+    """Narrower colorbars + spacing for 3–5 panels to reduce overlap with neighbor y-labels."""
+    if n_plots >= 5:
+        return dict(shrink=0.60, fraction=0.018, aspect=18, pad=0.018)
+    if n_plots >= 3:
+        # 略减 fraction、略增 pad：色条稍窄，标签离坐标区稍远，配合 right 边距避免右侧裁切
+        return dict(shrink=0.68, fraction=0.020, aspect=16, pad=0.032)
+    if n_plots == 2:
+        return dict(shrink=0.70, fraction=0.026, aspect=15, pad=0.045)
+    return dict(shrink=0.78, fraction=0.034, aspect=14, pad=0.05)
+
+
+def _normalize_geophys_vis_state(vis_state, both_checked, te_checked, tm_checked):
+    """
+    Keep vis_state keys consistent with current MT mode.
+    Both mode uses te_*/tm_*; TE/TM single mode uses resistivity/phase.
+    Without this, switching to Both leaves only 'model' drawable (order looks for te_resistivity, etc.).
+    """
+    if not vis_state:
+        return
+    keys = set(vis_state.keys())
+    has_te = any(k.startswith('te_') for k in keys)
+    has_tm = any(k.startswith('tm_') for k in keys)
+    has_single_r = 'resistivity' in vis_state
+    has_single_p = 'phase' in vis_state
+    new = dict(vis_state)
+
+    if both_checked:
+        if has_te or has_tm:
+            new.pop('resistivity', None)
+            new.pop('phase', None)
+        elif has_single_r or has_single_p:
+            if has_single_r:
+                new['te_resistivity'] = new.pop('resistivity')
+            if has_single_p:
+                new['te_phase'] = new.pop('phase')
+    else:
+        collapsed = {}
+        if 'model' in new:
+            collapsed['model'] = new['model']
+        if te_checked:
+            r = new.get('te_resistivity') or new.get('resistivity') or new.get('tm_resistivity')
+            p = new.get('te_phase') or new.get('phase') or new.get('tm_phase')
+        else:
+            r = new.get('tm_resistivity') or new.get('resistivity') or new.get('te_resistivity')
+            p = new.get('tm_phase') or new.get('phase') or new.get('te_phase')
+        if r is not None:
+            collapsed['resistivity'] = r
+        if p is not None:
+            collapsed['phase'] = p
+        new = collapsed
+
+    vis_state.clear()
+    vis_state.update(new)
+
+
+def _apply_geophys_canvas_pixel_size(canvas, min_w=450, min_h=350):
+    """Fix canvas pixel size to match figure so Qt layouts do not squash the figure; scroll if needed."""
+    from PyQt5.QtWidgets import QSizePolicy
+
+    fig = canvas.figure
+    w = int(np.ceil(fig.get_figwidth() * fig.dpi))
+    h = int(np.ceil(fig.get_figheight() * fig.dpi))
+    w = max(min_w, w)
+    h = max(min_h, h)
+    canvas.setFixedSize(w, h)
+    canvas.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    canvas.updateGeometry()
+
+
+def _reset_geophys_canvas_pixel_size(canvas, min_w=450, min_h=350):
+    from PyQt5.QtWidgets import QSizePolicy
+
+    canvas.setMinimumSize(min_w, min_h)
+    canvas.setMaximumSize(16777215, 16777215)
+    canvas.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+    canvas.updateGeometry()
+
+
+# Tight scrollbars + white viewport (less grey chrome around the plot)
+_GEOPHYS_PLOT_SCROLL_QSS = """
+QScrollArea { border: none; background: #ffffff; }
+QScrollBar:horizontal { height: 12px; margin: 0px; padding: 0px; }
+QScrollBar:vertical { width: 12px; margin: 0px; padding: 0px; }
+"""
+
 
 # Attempt to import PyQt5 with error handling
 try:
@@ -61,8 +327,8 @@ try:
                                 QSlider, QCheckBox, QSpinBox, QDoubleSpinBox, QTextEdit, 
                                 QProgressBar, QGroupBox, QGridLayout, QSplitter, QMessageBox, 
                                 QListWidget, QListWidgetItem, QMenu, QInputDialog, QDialog, QRadioButton,
-                                QMenuBar, QStatusBar, QToolBar, QAction, QFrame, QScrollArea)
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QEvent, QSize
+                                QMenuBar, QStatusBar, QToolBar, QAction, QFrame, QScrollArea, QSizePolicy)
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QEvent, QSize, QTimer
     from PyQt5.QtGui import QFont, QPixmap, QColor, QPalette, QTextCursor, QIcon
     
     # Configure font settings
@@ -135,6 +401,7 @@ class MPLCanvas(FigureCanvas):
         self.setParent(parent)
         self.fig.tight_layout()
         self.setMinimumSize(400, 300)
+        self._pan_ax = None
         
         # 用于图像放大的变量
         self.last_x, self.last_y = 0, 0
@@ -163,64 +430,106 @@ class MPLCanvas(FigureCanvas):
         self.axes.set_xlabel('')
         self.axes.set_ylabel('')
         self.axes.set_title('')
+        self._pan_ax = None
         self.draw()
         
     def on_mouse_press(self, event):
-        """鼠标按下事件，开始拖动或保存图像"""
+        """Mouse press: start pan or save image."""
         if event.button == 1:  # 左键
+            self._pan_ax = event.inaxes
             self.last_x, self.last_y = event.xdata, event.ydata
-            self.is_dragging = True
+            self.is_dragging = self._pan_ax is not None and event.xdata is not None
         elif event.button == 3:  # 右键
             # 右键点击直接保存图像，不再检查训练是否结束
             self.save_figure()
     
     def on_mouse_release(self, event):
-        """鼠标释放事件，结束拖动"""
+        """Mouse release: end pan."""
         if event.button == 1:  # 左键
             self.is_dragging = False
+            self._pan_ax = None
     
     def on_mouse_move(self, event):
-        """鼠标移动事件，实现拖动功能"""
-        if self.is_dragging and event.inaxes == self.axes:
-            dx = event.xdata - self.last_x
-            dy = event.ydata - self.last_y
-            
-            # 获取当前的视图范围
-            xlim = self.axes.get_xlim()
-            ylim = self.axes.get_ylim()
-            
-            # 调整视图范围
-            self.axes.set_xlim(xlim[0] - dx, xlim[1] - dx)
-            self.axes.set_ylim(ylim[0] - dy, ylim[1] - dy)
-            
-            self.last_x, self.last_y = event.xdata, event.ydata
-            self.draw()
+        """Mouse move: pan the view."""
+        if (
+            not self.is_dragging
+            or self._pan_ax is None
+            or event.inaxes is not self._pan_ax
+            or event.xdata is None
+            or event.ydata is None
+            or self.last_x is None
+            or self.last_y is None
+        ):
+            return
+        ax = self._pan_ax
+        dx = event.xdata - self.last_x
+        dy = event.ydata - self.last_y
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        ax.set_xlim(xlim[0] - dx, xlim[1] - dx)
+        ax.set_ylim(ylim[0] - dy, ylim[1] - dy)
+        self.last_x, self.last_y = event.xdata, event.ydata
+        self.draw()
     
     def on_mouse_scroll(self, event):
-        """鼠标滚轮事件，实现缩放功能"""
-        if event.inaxes == self.axes:
-            # 获取当前鼠标位置对应的坐标
-            x = event.xdata
-            y = event.ydata
-            
-            # 获取当前的视图范围
-            xlim = self.axes.get_xlim()
-            ylim = self.axes.get_ylim()
-            
-            # 计算缩放因子
-            scale_factor = 1.1 if event.button == 'up' else 0.9
-            
-            # 计算新的视图范围，以鼠标位置为中心进行缩放
-            new_xlim = [x - (x - xlim[0]) * scale_factor, x + (xlim[1] - x) * scale_factor]
-            new_ylim = [y - (y - ylim[0]) * scale_factor, y + (ylim[1] - y) * scale_factor]
-            
-            # 设置新的视图范围
-            self.axes.set_xlim(new_xlim)
-            self.axes.set_ylim(new_ylim)
-            self.draw()
+        """Mouse wheel: zoom."""
+        ax = event.inaxes
+        if ax is None or event.xdata is None or event.ydata is None:
+            return
+        x, y = event.xdata, event.ydata
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        scale_factor = 1.1 if event.button == 'up' else 0.9
+        new_xlim = [x - (x - xlim[0]) * scale_factor, x + (xlim[1] - x) * scale_factor]
+        new_ylim = [y - (y - ylim[0]) * scale_factor, y + (ylim[1] - y) * scale_factor]
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self.draw()
+    
+    def wheelEvent(self, event):
+        """Mouse wheel scrolls the wrapping QScrollArea when the figure is larger than the viewport; Ctrl+wheel keeps axis zoom."""
+        from PyQt5.QtWidgets import QScrollArea
+
+        if event.modifiers() & Qt.ControlModifier:
+            super(MPLCanvas, self).wheelEvent(event)
+            return
+
+        scroll = self.parent()
+        while scroll is not None and not isinstance(scroll, QScrollArea):
+            scroll = scroll.parentWidget()
+        if scroll is None:
+            super(MPLCanvas, self).wheelEvent(event)
+            return
+
+        dy = event.angleDelta().y()
+        dx = event.angleDelta().x()
+        if dy == 0 and dx == 0:
+            pd = event.pixelDelta()
+            dy, dx = pd.y(), pd.x()
+
+        vbar = scroll.verticalScrollBar()
+        hbar = scroll.horizontalScrollBar()
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+
+        if shift and hbar.maximum() > hbar.minimum():
+            step = dx if dx != 0 else dy
+            if step != 0:
+                hbar.setValue(hbar.value() - step)
+                event.accept()
+                return
+        if not shift and vbar.maximum() > vbar.minimum() and dy != 0:
+            vbar.setValue(vbar.value() - dy)
+            event.accept()
+            return
+        if not shift and hbar.maximum() > hbar.minimum() and dx != 0:
+            hbar.setValue(hbar.value() - dx)
+            event.accept()
+            return
+
+        super(MPLCanvas, self).wheelEvent(event)
     
     def save_figure(self, filename=None):
-        """保存当前图像到文件"""
+        """Save current figure to file."""
         if filename is None:
             # 获取文件格式过滤器
             filters = "PNG Files (*.png);;JPEG Files (*.jpg);;SVG Files (*.svg);;PDF Files (*.pdf)"
@@ -252,16 +561,76 @@ class MPLCanvas(FigureCanvas):
                 return False
         return False
 
+
+def _configure_geophys_plot_scroll(scroll_area):
+    scroll_area.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+    scroll_area.setContentsMargins(0, 0, 0, 0)
+    scroll_area.setFrameShape(QFrame.NoFrame)
+    scroll_area.setStyleSheet(_GEOPHYS_PLOT_SCROLL_QSS)
+    scroll_area.viewport().setStyleSheet("background-color: #ffffff;")
+
+
+def _configure_import_prediction_splitter(splitter):
+    """
+    Horizontal splitter shared by Data Import and Model Prediction: draggable width between control panel and plot canvas.
+    Equal stretch so widening the window grows both sides; otherwise extra width went only to the canvas and crushed the left panel.
+    Wider handle with hover highlight so the default 1px grip is easier to find.
+    """
+    splitter.setChildrenCollapsible(False)
+    splitter.setHandleWidth(10)
+    splitter.setStretchFactor(0, 1)
+    splitter.setStretchFactor(1, 1)
+    splitter.setStyleSheet(
+        "QSplitter::handle:horizontal { background: #d0d0d0; border: 1px solid #b0b0b0; }"
+        "QSplitter::handle:horizontal:hover { background: #2196F3; }"
+    )
+
+
+def _apply_import_pred_splitter_ratio(splitter, left_frac=0.45):
+    """
+    Apply left/right pane widths from the splitter's current total width.
+    Call after geometry is known; fixes huge right pane when setSizes() ran before layout.
+    """
+    if splitter is None or splitter.count() < 2:
+        return
+    total = splitter.width()
+    if total < 400:
+        return
+    hw = splitter.handleWidth()
+    inner = max(1, total - hw)
+    w0, w1 = splitter.widget(0), splitter.widget(1)
+    left_min = w0.minimumWidth() if w0 else 0
+    right_min = w1.minimumWidth() if w1 else 0
+    if inner < left_min + right_min:
+        return
+    left = int(round(inner * left_frac))
+    left = max(left_min, min(left, inner - right_min))
+    right = inner - left
+    if right < right_min:
+        right = right_min
+        left = max(left_min, inner - right)
+    splitter.setSizes([left, right])
+
+
 class DataImportTab(QWidget):
-    """数据导入和MT模式选择标签页"""
+    """Data import and MT mode selection tab."""
+    # TE/TM 单模式：模型 + 单套视电阻率 + 相位
+    VIS_TYPE_ORDER = ('model', 'resistivity', 'phase')
+    # Both：模型 + TE/TM 视电阻率 + TE/TM 相位（共 5 图，2×3 网格）
+    VIS_TYPE_ORDER_BOTH = ('model', 'te_resistivity', 'tm_resistivity', 'te_phase', 'tm_phase')
+    
     def __init__(self, parent=None):
         super(DataImportTab, self).__init__(parent)
         self.parent = parent
+        # Right-click visualization state: {display_type: file_path}
+        self.vis_state = {}
+        self.vis_dimensions = (5.0, 3.0)  # (length_km, depth_km) - cached from first dialog
         self.init_ui()
         self.check_file_counts()  # 初始化时检查文件数量
+        self._refresh_show_all_button_caption()
 
     def init_ui(self):
-        """初始化UI界面"""
+        """Initialize the UI."""
         # 创建主布局
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)  # 减少边距
@@ -272,6 +641,7 @@ class DataImportTab(QWidget):
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -565,10 +935,13 @@ class DataImportTab(QWidget):
         left_layout.addSpacing(10)
         left_layout.addWidget(data_files_group, 1)  # 使用stretch factor让内容自适应
         
-        # Right panel: Dataset visualization preview
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(10, 10, 10, 10)  # Set right panel margins
+        # Right column: scroll area wraps only the matplotlib canvas so wide multi-panel figures get scrollbars;
+        # buttons stay below and no longer compress the figure.
+        right_column = QWidget()
+        right_column.setMinimumWidth(400)
+        right_column.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(10, 10, 10, 10)
         
         self.visualization_title = QLabel("Data Visualization Preview")
         self.visualization_title.setAlignment(Qt.AlignCenter)
@@ -577,46 +950,86 @@ class DataImportTab(QWidget):
         font.setBold(True)
         self.visualization_title.setFont(font)
         
-        # Create Matplotlib canvas
-        self.canvas = MPLCanvas(self, width=5, height=4, dpi=100)
-        self.canvas.setMinimumHeight(300)  # Set canvas minimum height
+        self.canvas = MPLCanvas(self, width=10, height=4, dpi=100)
+        self.canvas.setMinimumHeight(300)
+        self.canvas.setMinimumWidth(400)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
-        # Create save image button
+        plot_scroll = QScrollArea()
+        plot_scroll.setWidgetResizable(True)
+        plot_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        plot_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        plot_scroll.setWidget(self.canvas)
+        plot_scroll.setMinimumHeight(400)
+        _configure_geophys_plot_scroll(plot_scroll)
+        
+        button_layout = QHBoxLayout()
         self.save_image_button = QPushButton("Save Image")
         self.save_image_button.clicked.connect(self.save_current_image)
         self.save_image_button.setDisabled(True)  # Initially disabled until image is displayed
         
-        # Image operation instructions label
-        operation_label = QLabel("Instructions: Wheel to zoom, left click to drag, right click to reset view")
+        self.show_all_button = QPushButton("Simultaneous View (2D Model + Apparent Resistivity + Phase)")
+        self.show_all_button.clicked.connect(self.visualize_all_simultaneously)
+        self.show_all_button.setToolTip(
+            "TE/TM single mode: model + apparent resistivity + phase; Both: model + TE/TM apparent resistivity + TE/TM phase (up to 5 panels)."
+        )
+        self.show_all_button.setStyleSheet("padding: 6px 10px; background-color: #2196F3; color: white; border: none; border-radius: 4px;")
+        
+        self.clear_vis_button = QPushButton("Clear")
+        self.clear_vis_button.clicked.connect(self.clear_visualization)
+        self.clear_vis_button.setToolTip("Clear all visualizations and reset canvas")
+        
+        button_layout.addWidget(self.save_image_button)
+        button_layout.addWidget(self.show_all_button)
+        button_layout.addWidget(self.clear_vis_button)
+        
+        operation_label = QLabel(
+            "Instructions: When the figure is larger than the panel, use the scrollbars or mouse wheel to move up/down and left/right "
+            "(Shift+wheel for horizontal); Ctrl+wheel zooms the axes under the cursor; left drag to pan; right click to save image."
+        )
+        operation_label.setWordWrap(True)
         operation_label.setAlignment(Qt.AlignCenter)
         operation_label.setStyleSheet("font-size: 10px; color: gray;")
         
-        # Add to right layout
         right_layout.addWidget(self.visualization_title)
-        right_layout.addWidget(self.canvas)
-        right_layout.addWidget(self.save_image_button)
+        right_layout.addWidget(plot_scroll, 1)
+        right_layout.addSpacing(18)
+        right_layout.addLayout(button_layout)
         right_layout.addWidget(operation_label)
         
-        # Move channel information to right panel
         channel_info_layout = QVBoxLayout()
         channel_info_container = QWidget()
         channel_info_container.setStyleSheet("border: 1px solid #E0E0E0; padding: 8px; background-color: #F5F5F5;")
         channel_info_layout.addWidget(self.channel_info)
         channel_info_container.setLayout(channel_info_layout)
-        
-        right_layout.addSpacing(8)
+        right_layout.addSpacing(6)
         right_layout.addWidget(channel_info_container)
-        right_layout.addStretch()  # Add stretch factor to distribute components properly in right panel
         
-        # Add left scroll area and right panel to splitter
         left_scroll.setWidget(left_panel)
+        left_scroll.setMinimumWidth(380)
         splitter.addWidget(left_scroll)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([700, 300])  # Increase left panel space, reduce right panel space to ensure left text is fully displayed
+        splitter.addWidget(right_column)
+        _configure_import_prediction_splitter(splitter)
+        splitter.setSizes([600, 520])
+        self.import_plot_splitter = splitter
+        QTimer.singleShot(0, self._ensure_import_splitter_ratio_once)
         
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
     
+    def _ensure_import_splitter_ratio_once(self):
+        if getattr(self, '_import_splitter_ratio_applied', False):
+            return
+        sp = getattr(self, 'import_plot_splitter', None)
+        if not sp or sp.width() < 400:
+            return
+        _apply_import_pred_splitter_ratio(sp, 0.45)
+        self._import_splitter_ratio_applied = True
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._ensure_import_splitter_ratio_once()
+
     def update_mode_selection(self, sender):
         """Update MT mode selection, ensure only one option is selected, and update channel information"""
         if sender.isChecked():
@@ -636,6 +1049,18 @@ class DataImportTab(QWidget):
             self.update_import_buttons_visibility()
             # Check file counts after mode switch
             self.check_file_counts()
+            self._refresh_show_all_button_caption()
+            if self.vis_state:
+                try:
+                    self._redraw_visualization()
+                except Exception:
+                    pass
+    
+    def _refresh_show_all_button_caption(self):
+        if self.both_radio.isChecked():
+            self.show_all_button.setText("Simultaneous View (Model + TE/TM Apparent Resistivity + TE/TM Phase)")
+        else:
+            self.show_all_button.setText("Simultaneous View (2D Model + Apparent Resistivity + Phase)")
     
     def update_import_buttons_visibility(self):
         """Update import button visibility and layout based on currently selected mode"""
@@ -726,8 +1151,8 @@ class DataImportTab(QWidget):
             if not param_updated:
                 updated_lines.append(f'\n{param_name} = {repr(value)}  # Added by GUI\n')
             
-            # Write back to the file
-            with open('ParamConfig.py', 'w', encoding='utf-8') as f:
+            # Write back to the file（与读取使用同一绝对路径）
+            with open(param_config_path, 'w', encoding='utf-8') as f:
                 f.writelines(updated_lines)
             
         except Exception as e:
@@ -932,7 +1357,7 @@ class DataImportTab(QWidget):
             if action == visualize_action:
                 file_path = self.te_resistivity_files.currentItem().data(Qt.UserRole)
                 data_type = self.te_resistivity_files.currentItem().data(Qt.UserRole + 1) or 'resistivity'
-                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type)
+                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type, mt_source='TE')
     
     def show_te_phase_context_menu(self, position):
         """Show right-click menu for TE Phase files"""
@@ -944,7 +1369,7 @@ class DataImportTab(QWidget):
             if action == visualize_action:
                 file_path = self.te_phase_files.currentItem().data(Qt.UserRole)
                 data_type = self.te_phase_files.currentItem().data(Qt.UserRole + 1) or 'phase'
-                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type)
+                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type, mt_source='TE')
     
     def show_tm_resistivity_context_menu(self, position):
         """Show right-click menu for TM Apparent Resistivity files"""
@@ -956,7 +1381,7 @@ class DataImportTab(QWidget):
             if action == visualize_action:
                 file_path = self.tm_resistivity_files.currentItem().data(Qt.UserRole)
                 data_type = self.tm_resistivity_files.currentItem().data(Qt.UserRole + 1) or 'resistivity'
-                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type)
+                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type, mt_source='TM')
     
     def show_tm_phase_context_menu(self, position):
         """Show right-click menu for TM Phase files"""
@@ -968,7 +1393,7 @@ class DataImportTab(QWidget):
             if action == visualize_action:
                 file_path = self.tm_phase_files.currentItem().data(Qt.UserRole)
                 data_type = self.tm_phase_files.currentItem().data(Qt.UserRole + 1) or 'phase'
-                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type)
+                self.visualize_specific_file(file_path, is_input_data=True, data_type=data_type, mt_source='TM')
     
     def show_label_file_context_menu(self, position):
         """Show right-click menu for label files"""
@@ -994,188 +1419,362 @@ class DataImportTab(QWidget):
         # Call import method to let user reselect file
         self.import_specific_data(mode, data_type_value)
         
-    def visualize_specific_file(self, file_path, is_input_data=True, data_type=None):
-        """Visualize specific data file"""
-        # Read file data and process as required
-        model_size = 32
-        file_name = os.path.basename(file_path)
-        # 添加缺失的变量定义
-        config_dir = os.path.dirname(file_path)
-        base_filename = os.path.splitext(file_name)[0].replace('pred_', '')
+    def _get_display_type(self, is_input_data, data_type, mt_source=None):
+        """Map to vis_state keys: TE/TM split in Both mode; single mode uses resistivity / phase."""
+        if not is_input_data:
+            return 'model'
+        if self.both_radio.isChecked() and mt_source in ('TE', 'TM'):
+            if data_type == 'resistivity':
+                return 'te_resistivity' if mt_source == 'TE' else 'tm_resistivity'
+            return 'te_phase' if mt_source == 'TE' else 'tm_phase'
+        return 'resistivity' if data_type == 'resistivity' else 'phase'
+
+    def _visual_type_order(self):
+        return self.VIS_TYPE_ORDER_BOTH if self.both_radio.isChecked() else self.VIS_TYPE_ORDER
+
+    def _visual_type_info(self):
+        m = {
+            'model': ('2D Resistivity Model', 'lgρ(Ω·m)', True),
+            'resistivity': ('Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'phase': ('Phase Profile', 'φ(°)', False),
+            'te_resistivity': ('TE Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'tm_resistivity': ('TM Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'te_phase': ('TE Phase', 'φ(°)', False),
+            'tm_phase': ('TM Phase', 'φ(°)', False),
+        }
+        return m
+    
+    def _show_model_size_dialog(self):
+        """Show model size dialog, return (length, depth) or None if cancelled."""
+        class ModelSizeDialog(QDialog):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("Section physical extent")
+                self.setFixedSize(360, 200)
+                layout = QVBoxLayout(self)
+                tip = QLabel(
+                    "Enter profile length and maximum depth (km) for apparent resistivity, phase, or resistivity model.\n"
+                    "The plot fills this rectangle in physical units (no forced pixel whitespace)."
+                )
+                tip.setWordWrap(True)
+                layout.addWidget(tip)
+                length_layout = QHBoxLayout()
+                length_layout.addWidget(QLabel("Profile length (km):"))
+                self.length_spin = QDoubleSpinBox()
+                self.length_spin.setRange(0.1, 100.0)
+                self.length_spin.setDecimals(1)
+                self.length_spin.setValue(5.0)
+                length_layout.addWidget(self.length_spin)
+                depth_layout = QHBoxLayout()
+                depth_layout.addWidget(QLabel("Maximum depth (km):"))
+                self.depth_spin = QDoubleSpinBox()
+                self.depth_spin.setRange(0.1, 50.0)
+                self.depth_spin.setDecimals(1)
+                self.depth_spin.setValue(3.0)
+                depth_layout.addWidget(self.depth_spin)
+                btn_layout = QHBoxLayout()
+                ok_btn = QPushButton("OK")
+                cancel_btn = QPushButton("Cancel")
+                ok_btn.clicked.connect(self.accept)
+                cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(ok_btn)
+                btn_layout.addWidget(cancel_btn)
+                layout.addLayout(length_layout)
+                layout.addLayout(depth_layout)
+                layout.addLayout(btn_layout)
         
-        try:
-            # Create custom dialog for user to input both model length and depth
-            class ModelSizeDialog(QDialog):
-                def __init__(self, parent=None):
-                    super().__init__(parent)
-                    self.setWindowTitle("Model Size Input")
-                    self.setFixedSize(300, 150)
-                    
-                    layout = QVBoxLayout(self)
-                    
-                    # Create length input
-                    length_layout = QHBoxLayout()
-                    length_label = QLabel("Model Length (km):")
-                    self.length_spin = QDoubleSpinBox()
-                    self.length_spin.setRange(0.1, 100.0)
-                    self.length_spin.setDecimals(1)
-                    self.length_spin.setValue(5.0)  # Default value
-                    length_layout.addWidget(length_label)
-                    length_layout.addWidget(self.length_spin)
-                    
-                    # Create depth input
-                    depth_layout = QHBoxLayout()
-                    depth_label = QLabel("Model Depth (km):")
-                    self.depth_spin = QDoubleSpinBox()
-                    self.depth_spin.setRange(0.1, 50.0)
-                    self.depth_spin.setDecimals(1)
-                    self.depth_spin.setValue(3.0)  # Default value
-                    depth_layout.addWidget(depth_label)
-                    depth_layout.addWidget(self.depth_spin)
-                    
-                    # Create buttons
-                    button_layout = QHBoxLayout()
-                    ok_button = QPushButton("OK")
-                    cancel_button = QPushButton("Cancel")
-                    ok_button.clicked.connect(self.accept)
-                    cancel_button.clicked.connect(self.reject)
-                    button_layout.addWidget(ok_button)
-                    button_layout.addWidget(cancel_button)
-                    
-                    # Add to main layout
-                    layout.addLayout(length_layout)
-                    layout.addLayout(depth_layout)
-                    layout.addLayout(button_layout)
-                    
-            # Show dialog and get user input
-            dialog = ModelSizeDialog(self)
-            if dialog.exec_() == QDialog.Accepted:
-                length = dialog.length_spin.value()
-                depth = dialog.depth_spin.value()
-            else:
-                # User canceled input
+        dialog = ModelSizeDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            return (dialog.length_spin.value(), dialog.depth_spin.value())
+        return None
+    
+    def _redraw_visualization(self):
+        """Redraw canvas from vis_state with vertical split layout."""
+        if not self.vis_state:
+            return
+        _normalize_geophys_vis_state(
+            self.vis_state,
+            self.both_radio.isChecked(),
+            self.te_radio.isChecked(),
+            self.tm_radio.isChecked(),
+        )
+        length, depth = self.vis_dimensions
+        num_ticks = 5
+        type_info = self._visual_type_info()
+        order = self._visual_type_order()
+        plots = []
+        for dt in order:
+            if dt not in self.vis_state:
+                continue
+            fp = self.vis_state[dt]
+            title, cbar_label, is_res = type_info[dt]
+            try:
+                data, _ = self._load_and_prepare_plot_data(
+                    fp, is_res, 32, length, depth, transpose_like_mt_input=(dt != "model")
+                )
+                plots.append((data, f"{title}\n{os.path.basename(fp)}", cbar_label))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to load {fp}: {e}")
                 return
-            
-            # Read file data, assuming data is separated by spaces or tabs
-            data = np.loadtxt(file_path)
-            
-            # 修复数据重塑逻辑，确保1024元素数据正确重塑为32x32
-            # 首先检查数据形状，如果是一维数组，需要重塑
-            if len(data.shape) == 1:
-                # 直接根据数据长度进行重塑
-                if data.size == 1024:
-                    # 明确处理1024元素的情况，重塑为32x32
-                    data = data.reshape(32, 32)
-                elif data.size == 256:
-                    # 处理256元素的情况，重塑为16x16
-                    data = data.reshape(16, 16)
-                else:
-                    # 尝试从配置中获取实际的数据维度
-                    actual_data_dim = None
-                    try:
-                        import glob
-                        config_files = glob.glob(os.path.join(config_dir, f"pred_config_*{base_filename}*.json"))
-                        if config_files:
-                            with open(config_files[0], 'r', encoding='utf-8') as f:
-                                import json
-                                config = json.load(f)
-                                if 'data_dim' in config and isinstance(config['data_dim'], list) and len(config['data_dim']) == 2:
-                                    actual_data_dim = config['data_dim']
-                    except Exception:
-                        pass
-                    
-                    # 根据实际维度重塑数据
-                    if actual_data_dim and len(data) >= actual_data_dim[0] * actual_data_dim[1]:
-                        # 使用配置文件中的实际维度
-                        data = data[:actual_data_dim[0] * actual_data_dim[1]].reshape(actual_data_dim)
-                    else:
-                        # 对于其他情况，尝试计算合适的形状
-                        size = int(np.sqrt(data.size))
-                        # 找到最接近的合适尺寸
-                        data = data[:size*size].reshape(size, size)
-            
-            # Determine whether to apply logarithm based on file type
-            # For apparent resistivity files, always apply logarithm
-            # For phase files, do not apply logarithm
-            is_resistivity = (is_input_data and data_type == 'resistivity') or (not is_input_data)
-            if is_resistivity:
-                # First take absolute value to ensure no negative values, then add a small value to avoid log10(0)
-                data = np.log10(np.abs(data) + 1e-10)
-            
-            # Visualize processed data
-            # Reset figure more thoroughly: clear all axes and recreate main axis
-            self.canvas.figure.clear()
-            
-            # Recreate main axis
-            self.canvas.axes = self.canvas.figure.add_subplot(111)
-            
-            # Adjust figure aspect ratio based on user-input length and depth
-            # Calculate actual aspect ratio and set reasonable limits (between 0.5 and 2 to avoid overly flat or elongated figures)
-            aspect_ratio = min(max(depth / length, 0.5), 2.0)
-            im = self.canvas.axes.imshow(data, cmap='jet', aspect=aspect_ratio, origin='upper')
-            
-            # Add colorbar and limit number of ticks to 3-4
-            # Set colorbar height to match figure height
-            cbar = self.canvas.figure.colorbar(im, ax=self.canvas.axes, shrink=1.1)
-            
-            # Set colorbar label based on data type
-            if is_input_data:
-                if data_type == 'resistivity':
-                    cbar.set_label('lgρ(Ω·m)')  # Resistivity unit
-                    print(f"Debug: Set unit to lgρ(Ω·m)")
-                else:
-                    cbar.set_label('φ(°)')  # Phase unit
-                    print(f"Debug: Set unit to φ(°)")
-            else:
-                # Label data is always resistivity
-                cbar.set_label('lgρ(Ω·m)')  # Resistivity unit
+        
+        if not plots:
+            return
+        
+        n = len(plots)
+        axes_list = _create_axes_for_plot_count(self.canvas.figure, n)
+        cb_kw = _geophys_colorbar_kwargs(n)
+        title_fs = 8 if n >= 5 else 10
+        for i, (data, title, cbar_label) in enumerate(plots):
+            ax = axes_list[i]
+            im = _draw_geophysical_section(ax, data, length, depth, cmap='jet_r', num_ticks=num_ticks)
+            cbar = self.canvas.figure.colorbar(im, ax=ax, **cb_kw)
+            cbar.set_label(cbar_label, fontsize=9 if n >= 3 else 10)
+            cbar.ax.tick_params(labelsize=8 if n >= 3 else 9)
             cbar.locator = plt.MaxNLocator(nbins=4)
             cbar.update_ticks()
-            
-            # Set title
-            if is_input_data:
-                data_type_text = f"Input Data: {file_name}" + (" (TE Mode)" if self.te_radio.isChecked() else " (TM Mode)" if self.tm_radio.isChecked() else " (Both Modes)")
-                if data_type == 'resistivity':
-                    data_type_text += ""
-            else:
-                data_type_text = f"Label Data: {file_name} "
-                
-            # Set centered title
-            self.canvas.axes.set_title(data_type_text, loc='center')
-            
-            # Set axis ticks and labels to display user-input model dimensions
-            # x-axis (horizontal) represents length, y-axis (vertical) represents depth
-            num_ticks = 5  # Set number of ticks
-            x_ticks = np.linspace(0, model_size-1, num_ticks)
-            y_ticks = np.linspace(0, model_size-1, num_ticks)
-            
-            # Calculate corresponding actual dimension values
-            x_tick_labels = [f"{x:.1f}" for x in np.linspace(0, length, num_ticks)]
-            y_tick_labels = [f"{y:.1f}" for y in np.linspace(0, depth, num_ticks)]
-            
-            # Set tick positions and labels
-            self.canvas.axes.set_xticks(x_ticks)
-            self.canvas.axes.set_yticks(y_ticks)
-            self.canvas.axes.set_xticklabels(x_tick_labels)
-            self.canvas.axes.set_yticklabels(y_tick_labels)
-            
-            # Set axis labels
-            self.canvas.axes.set_xlabel('Length (km)')
-            self.canvas.axes.set_ylabel('Depth (km)')
-            
-            # Adjust layout to ensure all elements are displayed correctly
-            self.canvas.figure.tight_layout()
-            
-            # Redraw the canvas
-            self.canvas.draw()
-            
-            # Enable save image button
-            self.save_image_button.setEnabled(True)
+            ax.set_title(title, fontsize=title_fs)
         
+        _finalize_figure_layout(self.canvas.figure, n)
+        self.canvas.draw()
+        _apply_geophys_canvas_pixel_size(self.canvas)
+        self.save_image_button.setEnabled(True)
+    
+    def visualize_specific_file(self, file_path, is_input_data=True, data_type=None, mt_source=None):
+        """Visualize with split/replace logic: new type adds subplot, same type replaces."""
+        file_name = os.path.basename(file_path)
+        display_type = self._get_display_type(is_input_data, data_type, mt_source)
+        
+        # First visualization: show dialog, full canvas
+        if not self.vis_state:
+            dims = self._show_model_size_dialog()
+            if dims is None:
+                return
+            self.vis_dimensions = dims
+            self.vis_state[display_type] = file_path
+        else:
+            # Same type: replace in place
+            if display_type in self.vis_state:
+                self.vis_state[display_type] = file_path
+            else:
+                # New type: add subplot (reuse cached dimensions)
+                self.vis_state[display_type] = file_path
+        
+        try:
+            self._redraw_visualization()
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Cannot visualize file {file_name}: {str(e)}")
-            # Disable save button when error occurs
             self.save_image_button.setEnabled(False)
+    
+    def clear_visualization(self):
+        """Clear all visualizations and reset canvas."""
+        self.vis_state.clear()
+        self.canvas.figure.clear()
+        self.canvas.axes = self.canvas.figure.add_subplot(111)
+        self.canvas.axes.set_xticks([])
+        self.canvas.axes.set_yticks([])
+        self.canvas.axes.set_xlabel('')
+        self.canvas.axes.set_ylabel('')
+        self.canvas.axes.set_title('')
+        self.canvas.figure.tight_layout()
+        self.canvas.draw()
+        _reset_geophys_canvas_pixel_size(self.canvas, min_w=450, min_h=540)
+        self.save_image_button.setEnabled(False)
+    
+    def _load_and_prepare_plot_data(self, file_path, is_resistivity, model_size, length, depth, transpose_like_mt_input=False):
+        """Load and preprocess data for plotting; return the 2D array.
+        transpose_like_mt_input: True for apparent resistivity/phase (same .T after ensure as DataLoad_Train / MT_test.load_test_data); False for inversion model.
+        """
+        data = np.loadtxt(file_path)
+        config_dir = os.path.dirname(file_path)
+        base_filename = os.path.splitext(os.path.basename(file_path))[0].replace('pred_', '')
+        
+        if len(data.shape) == 1:
+            if data.size == 1024:
+                data = data.reshape(32, 32)
+            elif data.size == 256:
+                data = data.reshape(16, 16)
+            else:
+                try:
+                    import glob, json
+                    config_files = glob.glob(os.path.join(config_dir, f"pred_config_*{base_filename}*.json"))
+                    if config_files:
+                        with open(config_files[0], 'r', encoding='utf-8') as f:
+                            config = json.load(f)
+                            if 'data_dim' in config and isinstance(config['data_dim'], list) and len(config['data_dim']) == 2:
+                                dim = config['data_dim']
+                                data = data[:dim[0]*dim[1]].reshape(dim)
+                                model_size = max(dim)
+                    else:
+                        size = int(np.sqrt(data.size))
+                        data = data[:size*size].reshape(size, size)
+                except Exception:
+                    size = int(np.sqrt(data.size))
+                    data = data[:size*size].reshape(size, size)
+
+        data = _ensure_data_dim_grid(data)
+        if transpose_like_mt_input:
+            data = np.asarray(data).T
+        if is_resistivity:
+            data = np.log10(np.abs(data) + 1e-10)
+        return data, model_size
+    
+    def visualize_all_simultaneously(self):
+        """Combined view: 3 plots in single mode; 5 in Both (model + TE/TM apparent resistivity + phase)."""
+        both = self.both_radio.isChecked()
+        if self.te_radio.isChecked():
+            res_list, phase_list = self.te_resistivity_files, self.te_phase_files
+        elif self.tm_radio.isChecked():
+            res_list, phase_list = self.tm_resistivity_files, self.tm_phase_files
+        else:
+            res_list, phase_list = self.te_resistivity_files, self.te_phase_files
+        
+        model_path = None
+        te_res_path = te_ph_path = tm_res_path = tm_ph_path = None
+        res_path = phase_path = None
+        
+        if both:
+            idx, te_res_path, te_ph_path, tm_res_path, tm_ph_path = _both_mode_resolve_te_tm_paths(
+                self.te_resistivity_files,
+                self.te_phase_files,
+                self.tm_resistivity_files,
+                self.tm_phase_files,
+                (self.label_file_list,),
+            )
+            model_path = _qlist_path_at_row(self.label_file_list, idx) or _qlist_path_at_row(self.label_file_list, 0)
+            if not any([model_path, te_res_path, te_ph_path, tm_res_path, tm_ph_path]):
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "In Both mode, import label and TE/TM apparent resistivity and phase files with entries at the same index.",
+                )
+                return
+        else:
+            idx = 0
+            if res_list.currentItem():
+                idx = res_list.row(res_list.currentItem())
+            elif phase_list.currentItem():
+                idx = phase_list.row(phase_list.currentItem())
+            if self.label_file_list.count() > idx:
+                it = self.label_file_list.item(idx)
+                if it:
+                    model_path = it.data(Qt.UserRole)
+            if res_list.count() > idx:
+                it = res_list.item(idx)
+                if it:
+                    res_path = it.data(Qt.UserRole)
+            if phase_list.count() > idx:
+                it = phase_list.item(idx)
+                if it:
+                    phase_path = it.data(Qt.UserRole)
+            if not model_path and not res_path and not phase_path:
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "Please import resistivity model, apparent resistivity, and phase data files first.",
+                )
+                return
+        
+        class ModelSizeDialog(QDialog):
+            def __init__(self, parent=None, both_mode=False):
+                super().__init__(parent)
+                self.setWindowTitle("Section physical extent")
+                self.setFixedSize(380, 220)
+                layout = QVBoxLayout(self)
+                tip_txt = (
+                    "Enter length and depth (km) for model and observations.\nBoth mode shows up to 5 panels."
+                    if both_mode
+                    else "Enter length and depth (km) for model / apparent resistivity / phase.\nPlots fill this physical rectangle."
+                )
+                tip = QLabel(tip_txt)
+                tip.setWordWrap(True)
+                layout.addWidget(tip)
+                length_layout = QHBoxLayout()
+                length_layout.addWidget(QLabel("Profile length (km):"))
+                self.length_spin = QDoubleSpinBox()
+                self.length_spin.setRange(0.1, 100.0)
+                self.length_spin.setValue(5.0)
+                length_layout.addWidget(self.length_spin)
+                depth_layout = QHBoxLayout()
+                depth_layout.addWidget(QLabel("Maximum depth (km):"))
+                self.depth_spin = QDoubleSpinBox()
+                self.depth_spin.setRange(0.1, 50.0)
+                self.depth_spin.setValue(3.0)
+                depth_layout.addWidget(self.depth_spin)
+                btn_layout = QHBoxLayout()
+                ok_btn = QPushButton("OK")
+                cancel_btn = QPushButton("Cancel")
+                ok_btn.clicked.connect(self.accept)
+                cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(ok_btn)
+                btn_layout.addWidget(cancel_btn)
+                layout.addLayout(length_layout)
+                layout.addLayout(depth_layout)
+                layout.addLayout(btn_layout)
+        
+        dialog = ModelSizeDialog(self, both_mode=both)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        length = dialog.length_spin.value()
+        depth = dialog.depth_spin.value()
+        type_info = self._visual_type_info()
+        plots = []
+        
+        def add_plot(path, key):
+            if not path or not os.path.exists(path):
+                return
+            try:
+                t, clab, is_res = type_info[key]
+                data, _ = self._load_and_prepare_plot_data(
+                    path, is_res, 32, length, depth, transpose_like_mt_input=(key != "model")
+                )
+                plots.append((data, f"{t}\n{os.path.basename(path)}", clab))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to load {path}: {e}")
+        
+        if both:
+            order_keys = self.VIS_TYPE_ORDER_BOTH
+            paths = {
+                'model': model_path,
+                'te_resistivity': te_res_path,
+                'tm_resistivity': tm_res_path,
+                'te_phase': te_ph_path,
+                'tm_phase': tm_ph_path,
+            }
+            for k in order_keys:
+                add_plot(paths.get(k), k)
+        else:
+            if model_path:
+                add_plot(model_path, 'model')
+            if res_path:
+                add_plot(res_path, 'resistivity')
+            if phase_path:
+                add_plot(phase_path, 'phase')
+        
+        if not plots:
+            QMessageBox.warning(self, "Error", "Unable to load any data file")
+            return
+        
+        n_plots = len(plots)
+        axes_list = _create_axes_for_plot_count(self.canvas.figure, n_plots)
+        cb_kw = _geophys_colorbar_kwargs(n_plots)
+        title_fs = 8 if n_plots >= 5 else 10
+        num_ticks = 5
+        
+        for i, (data, title, cbar_label) in enumerate(plots):
+            ax = axes_list[i]
+            im = _draw_geophysical_section(ax, data, length, depth, cmap='jet_r', num_ticks=num_ticks)
+            cbar = self.canvas.figure.colorbar(im, ax=ax, **cb_kw)
+            cbar.set_label(cbar_label, fontsize=9 if n_plots >= 3 else 10)
+            cbar.ax.tick_params(labelsize=8 if n_plots >= 3 else 9)
+            cbar.locator = plt.MaxNLocator(nbins=4)
+            cbar.update_ticks()
+            ax.set_title(title, fontsize=title_fs)
+        
+        _finalize_figure_layout(self.canvas.figure, n_plots)
+        self.canvas.draw()
+        _apply_geophys_canvas_pixel_size(self.canvas)
+        self.save_image_button.setEnabled(True)
         
     def preview_data(self, folder_path, is_input_data=True):
         """Preview data folder contents"""
@@ -1212,7 +1811,7 @@ class ModelConfigTab(QWidget):
         model_layout = QVBoxLayout()
         
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["UnetModel", "DinkNet"])
+        self.model_combo.addItems(["UnetModel", "DinkNet", "UnetPlusPlus"])
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
         
         model_layout.addWidget(QLabel("Select MT-specific model:"))
@@ -1348,9 +1947,9 @@ class ModelConfigTab(QWidget):
             if hasattr(ParamConfig, 'EarlyStop'):
                 self.early_stop.setValue(ParamConfig.EarlyStop)
             else:
-                self.early_stop.setValue(20)
+                self.early_stop.setValue(10)
         except:
-            self.early_stop.setValue(20)
+            self.early_stop.setValue(10)
         params_layout.addWidget(self.early_stop, 6, 1)
         params_layout.addWidget(QLabel("(Patience epochs)"), 6, 2)
         
@@ -1628,8 +2227,9 @@ class TrainingTab(QWidget):
         monitor_layout.setContentsMargins(10, 5, 10, 5)  # Set inner margins
         monitor_layout.setSpacing(10)  # Set spacing
         
-        # Create loss curve canvas with adjusted height
-        self.loss_canvas = MPLCanvas(self, width=6, height=3.5, dpi=100)  # Reduce height to minimize black border
+        # 损失曲线：高度过小 + 布局拉宽时 X 轴刻度易被裁切，略增高图幅并见 update_loss_curve 内 subplots_adjust
+        self.loss_canvas = MPLCanvas(self, width=7, height=4.5, dpi=100)
+        self.loss_canvas.setMinimumHeight(320)
         
         # Training progress bar with customized style to avoid overlapping
         self.progress_bar = QProgressBar()
@@ -1793,11 +2393,11 @@ class TrainingTab(QWidget):
         if hasattr(self, 'training_thread') and self.training_thread and self.training_thread.isRunning():
             # 发送停止信号
             self.training_thread.stop()
-            self.update_training_info("正在停止训练...")
+            self.update_training_info("Stopping training...")
             
             # 连接finished信号到清理槽函数
             def cleanup_thread():
-                """在线程完全结束后清理资源"""
+                """Clean up resources after the thread has fully finished."""
                 if hasattr(self, 'training_thread') and self.training_thread:
                     thread_ref = self.training_thread
                     # 确保线程已经完全结束
@@ -1805,16 +2405,16 @@ class TrainingTab(QWidget):
                         # 使用deleteLater()让Qt安全地管理线程对象的销毁
                         thread_ref.deleteLater()
                         self.training_thread = None
-                        self.update_training_info("训练进程已停止，资源已安全释放")
+                        self.update_training_info("Training process stopped, resources released safely")
                     else:
                         # 如果还在运行，等待一下
                         thread_ref.wait(2000)  # 等待最多2秒
                         if not thread_ref.isRunning():
                             thread_ref.deleteLater()
                             self.training_thread = None
-                            self.update_training_info("训练进程已停止，资源已安全释放")
+                            self.update_training_info("Training process stopped, resources released safely")
                         else:
-                            self.update_training_info("警告: 线程无法正常结束")
+                            self.update_training_info("Warning: Thread could not terminate normally")
             
             # 如果线程已经在停止中，直接连接信号
             if not self.training_thread.isFinished():
@@ -1823,7 +2423,7 @@ class TrainingTab(QWidget):
                 
                 # 等待线程结束（最多等待3秒）
                 if not self.training_thread.wait(3000):
-                    self.update_training_info("警告: 等待线程结束超时")
+                    self.update_training_info("Warning: Timeout waiting for thread to end")
                     # 即使超时，也尝试清理
                     cleanup_thread()
             else:
@@ -1954,9 +2554,9 @@ class TrainingTab(QWidget):
             # 添加图例
             self.loss_canvas.axes.legend(loc='upper right')
             
-            # Add X and Y axis labels and ticks
-            self.loss_canvas.axes.set_xlabel('Epochs')
-            self.loss_canvas.axes.set_ylabel('Loss Value')
+            # Add X and Y axis labels and ticks（labelpad 防与刻度重叠）
+            self.loss_canvas.axes.set_xlabel('Epochs', labelpad=12)
+            self.loss_canvas.axes.set_ylabel('Loss Value', labelpad=10)
             
             # Set X-axis ticks to ensure correct display up to the target number of epochs
             if len(epochs) > 0:
@@ -2064,6 +2664,12 @@ class TrainingTab(QWidget):
                 # 确保Y轴轴线可见
                 self.loss_canvas.axes.spines['left'].set_visible(True)
             
+            # 宽画布下默认边距不足，X 轴数字与 “Epochs” 常被裁掉：显式留出下边距
+            self.loss_canvas.axes.tick_params(
+                axis='x', which='major', labelsize=9, pad=10, bottom=True, labelbottom=True
+            )
+            self.loss_canvas.fig.subplots_adjust(left=0.12, right=0.98, top=0.90, bottom=0.28)
+            
             # Only perform time-consuming draw operation when needed
             self.loss_canvas.draw()
     
@@ -2134,14 +2740,14 @@ class TrainingTab(QWidget):
                                 # 即使预测数据未加载，也要确保标签页已启用
                                 prediction_tab.predict_button.setEnabled(False)  # 但按钮仍需禁用
                             
-                            self.training_info.append(f"模型已自动加载到预测标签页: {latest_model_path}")
+                            self.training_info.append(f"Model automatically loaded to prediction tab: {latest_model_path}")
                         else:
-                            self.training_info.append("警告: 未找到任何模型文件，请手动加载模型")
+                            self.training_info.append("Warning: No model file found, please load model manually")
                 except Exception as e:
-                    self.training_info.append(f"自动加载模型到预测标签页时出错: {str(e)}")
+                    self.training_info.append(f"Error loading model to prediction tab: {str(e)}")
                 
                 # 无论训练结果如何，都显示训练已完成
-                QMessageBox.information(self, "训练完成", "训练进程已结束，MT_train.py已执行完毕。")
+                QMessageBox.information(self, "Training Complete", "Training process finished, MT_train.py has completed execution.")
         
         # 确保线程资源安全释放
         # 关键修复：等待线程完全完成后再清理，避免"QThread: Destroyed while thread is still running"错误
@@ -2151,14 +2757,14 @@ class TrainingTab(QWidget):
                 # 如果线程还在运行，等待它完成
                 # 使用finished信号来确保线程完成后再清理
                 def cleanup_after_finished():
-                    """在线程完全结束后清理资源"""
+                    """Clean up resources after the thread has fully finished."""
                     if self.training_thread is thread:
                         # 确保线程已经完全结束
                         if not thread.isRunning():
                             # 使用deleteLater()让Qt安全地管理线程对象的销毁
                             thread.deleteLater()
                             self.training_thread = None
-                            self.training_info.append("训练线程资源已安全释放")
+                            self.training_info.append("Training thread resources released safely")
                 
                 # 连接finished信号到清理函数（使用单次连接避免重复）
                 thread.finished.connect(cleanup_after_finished, Qt.UniqueConnection)
@@ -2172,10 +2778,10 @@ class TrainingTab(QWidget):
                 
                 # 如果超时后线程仍在运行，强制等待
                 if thread.isRunning():
-                    self.training_info.append("警告: 等待线程结束超时，强制等待...")
+                    self.training_info.append("Warning: Timeout waiting for thread to end, forcing wait...")
                     thread.wait(5000)  # 最多等待5秒
                     if thread.isRunning():
-                        self.training_info.append("错误: 线程无法正常结束，可能存在死锁")
+                        self.training_info.append("Error: Thread could not terminate normally, possible deadlock")
                     else:
                         thread.deleteLater()
                         self.training_thread = None
@@ -2267,20 +2873,20 @@ class TrainingThread(QThread):
             # 直接获取MT_train.py的绝对路径
             mt_train_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'MT_train.py')
             
-            self.update_signal.emit(f"正在启动MT_train.py进行训练")
-            self.update_signal.emit(f"MT_train.py路径: {mt_train_path}")
+            self.update_signal.emit(f"Starting MT_train.py for training")
+            self.update_signal.emit(f"MT_train.py path: {mt_train_path}")
             
             # 构建命令行参数，直接运行MT_train.py
             cmd_args = [sys.executable, mt_train_path]
             
-            self.update_signal.emit(f"执行命令: {' '.join(cmd_args)}")
+            self.update_signal.emit(f"Execute command: {' '.join(cmd_args)}")
             
             # 直接启动MT_train.py进程
             process = None
             try:
                 # 确保MT_train.py文件存在
                 if not os.path.exists(mt_train_path):
-                    self.update_signal.emit(f"错误: 找不到MT_train.py文件在路径: {mt_train_path}")
+                    self.update_signal.emit(f"Error: MT_train.py file not found at path: {mt_train_path}")
                     if not self.signals_emitted:
                         self.training_finished.emit(False)
                         self.signals_emitted = True
@@ -2288,15 +2894,15 @@ class TrainingThread(QThread):
                 
                 # 检查文件权限
                 if not os.access(mt_train_path, os.R_OK):
-                    self.update_signal.emit(f"错误: 没有读取MT_train.py文件的权限")
+                    self.update_signal.emit(f"Error: No permission to read MT_train.py file")
                     if not self.signals_emitted:
                         self.training_finished.emit(False)
                         self.signals_emitted = True
                     return
                 
-                self.update_signal.emit(f"开始启动MT_train.py进程...")
-                self.update_signal.emit(f"Python解释器路径: {sys.executable}")
-                self.update_signal.emit(f"当前工作目录: {os.getcwd()}")
+                self.update_signal.emit(f"Starting MT_train.py process...")
+                self.update_signal.emit(f"Python interpreter path: {sys.executable}")
+                self.update_signal.emit(f"Current working directory: {os.getcwd()}")
                 
                 # 创建变量来跟踪是否有输出被捕获
                 has_output = False
@@ -2314,7 +2920,7 @@ class TrainingThread(QThread):
                     creationflags=subprocess.CREATE_NO_WINDOW,  # 不显示控制台窗口
                     cwd=dl_dir  # 明确设置工作目录为dl文件夹
                 )
-                self.update_signal.emit(f"MT_train.py进程已成功启动，PID: {process.pid}")
+                self.update_signal.emit(f"MT_train.py process started successfully, PID: {process.pid}")
                 
                 # 导入time模块用于休眠
                 import time
@@ -2323,10 +2929,10 @@ class TrainingThread(QThread):
                 while process.poll() is None:
                     # 检查是否停止训练
                     if self.stopped:
-                        self.update_signal.emit("正在停止训练...")
+                        self.update_signal.emit("Stopping training...")
                         try:
                             process.terminate()
-                            self.update_signal.emit(f"已发送终止信号，等待进程结束...")
+                            self.update_signal.emit(f"Termination signal sent, waiting for process to end...")
                              
                             # 等待进程终止，但设置更长的超时
                             wait_time = 0
@@ -2335,7 +2941,7 @@ class TrainingThread(QThread):
                                 wait_time += 0.1
                                  
                             if process.poll() is None:
-                                self.update_signal.emit("警告: 进程未能在超时时间内终止，尝试强制终止...")
+                                self.update_signal.emit("Warning: Process could not terminate within timeout, attempting force terminate...")
                                 process.kill()
                                  
                                 # 再等待一会儿确认进程终止
@@ -2344,13 +2950,13 @@ class TrainingThread(QThread):
                                     time.sleep(0.1)
                                     wait_time += 0.1
                         except Exception as terminate_error:
-                            self.update_signal.emit(f"停止进程时出错: {str(terminate_error)}")
+                            self.update_signal.emit(f"Error stopping process: {str(terminate_error)}")
                             import traceback
-                            self.update_signal.emit(f"终止错误详情: {traceback.format_exc()}")
+                            self.update_signal.emit(f"Termination error details: {traceback.format_exc()}")
                          
                         # 确保final_status变量在所有路径上都有定义
-                        final_status = "已终止" if process.poll() is not None else "未能完全终止"
-                        self.update_signal.emit(f"训练{final_status}")
+                        final_status = "Terminated" if process.poll() is not None else "Failed to fully terminate"
+                        self.update_signal.emit(f"Training {final_status}")
                         if not self.signals_emitted:
                             self.training_finished.emit(False)
                             self.signals_emitted = True
@@ -2358,17 +2964,17 @@ class TrainingThread(QThread):
                      
                     # 检查是否暂停训练
                     if self.paused:
-                        self.update_signal.emit("训练已暂停")
+                        self.update_signal.emit("Training paused")
                         # 等待直到恢复训练或停止训练
                         while self.paused and not self.stopped:
                             time.sleep(0.5)  # 避免CPU占用过高
                          
                         if self.stopped:
                             # 如果在暂停期间收到停止命令，执行停止逻辑
-                            self.update_signal.emit("正在停止训练...")
+                            self.update_signal.emit("Stopping training...")
                             try:
                                 process.terminate()
-                                self.update_signal.emit(f"已发送终止信号，等待进程结束...")
+                                self.update_signal.emit(f"Termination signal sent, waiting for process to end...")
                                  
                                 # 等待进程终止，但设置更长的超时
                                 wait_time = 0
@@ -2377,7 +2983,7 @@ class TrainingThread(QThread):
                                     wait_time += 0.1
                                  
                                 if process.poll() is None:
-                                    self.update_signal.emit("警告: 进程未能在超时时间内终止，尝试强制终止...")
+                                    self.update_signal.emit("Warning: Process could not terminate within timeout, attempting force terminate...")
                                     process.kill()
                                  
                                     # 再等待一会儿确认进程终止
@@ -2386,19 +2992,19 @@ class TrainingThread(QThread):
                                         time.sleep(0.1)
                                         wait_time += 0.1
                             except Exception as terminate_error:
-                                self.update_signal.emit(f"停止进程时出错: {str(terminate_error)}")
+                                self.update_signal.emit(f"Error stopping process: {str(terminate_error)}")
                                 import traceback
-                                self.update_signal.emit(f"终止错误详情: {traceback.format_exc()}")
+                                self.update_signal.emit(f"Termination error details: {traceback.format_exc()}")
                              
                             # 确保final_status变量在所有路径上都有定义
-                            final_status = "已终止" if process.poll() is not None else "未能完全终止"
-                            self.update_signal.emit(f"训练{final_status}")
+                            final_status = "Terminated" if process.poll() is not None else "Failed to fully terminate"
+                            self.update_signal.emit(f"Training {final_status}")
                             if not self.signals_emitted:
                                 self.training_finished.emit(False)
                                 self.signals_emitted = True
                             return
                         else:
-                            self.update_signal.emit("训练已恢复")
+                            self.update_signal.emit("Training resumed")
                      
                     # 尝试读取输出，使用try-except避免非套接字操作错误
                     try:
@@ -2410,13 +3016,13 @@ class TrainingThread(QThread):
                             
                             # 立即显示所有包含错误关键词的行
                             error_keywords = ['Error', 'error', 'Exception', 'exception', 'Traceback', 'traceback',
-                                            'Failed', 'failed', '失败', '错误', '异常', 'ImportError', 
+                                            'Failed', 'failed', 'ImportError',
                                             'ModuleNotFoundError', 'FileNotFoundError', 'ValueError', 'TypeError',
                                             'AttributeError', 'KeyError', 'IndexError', 'RuntimeError']
                             
                             if any(keyword in line_stripped for keyword in error_keywords):
                                 # 错误信息立即显示，不缓冲
-                                self.update_signal.emit(f"[错误] {line_stripped}")
+                                self.update_signal.emit(f"[Error] {line_stripped}")
                             
                             # 解析epoch信息以更新进度条
                             if "Epoch:" in line and "finished" in line:
@@ -2499,7 +3105,7 @@ class TrainingThread(QThread):
                             # 静默处理这个常见错误，不向用户显示
                             time.sleep(0.1)
                         else:
-                            self.update_signal.emit(f"读取输出时出错: {str(read_error)}")
+                            self.update_signal.emit(f"Error reading output: {str(read_error)}")
                             time.sleep(0.1)
                 
                 # 处理剩余的输出 - 确保读取所有输出，特别是错误信息
@@ -2520,7 +3126,7 @@ class TrainingThread(QThread):
                             except:
                                 pass
                 except Exception as read_remaining_error:
-                    self.update_signal.emit(f"读取剩余输出时出错: {str(read_remaining_error)}")
+                    self.update_signal.emit(f"Error reading remaining output: {str(read_remaining_error)}")
                 
                 # 训练完成，获取返回码
                 return_code = process.poll()
@@ -2531,35 +3137,35 @@ class TrainingThread(QThread):
                     output_lines = remaining_output.strip().split('\n')
                     if output_lines:
                         # 检查是否包含错误信息
-                        has_error = any(keyword in remaining_output for keyword in 
-                                       ['Error', 'error', 'Exception', 'exception', 'Traceback', 'traceback', 
-                                        'Failed', 'failed', '失败', '错误', '异常'])
+                        has_error = any(keyword in remaining_output for keyword in
+                                       ['Error', 'error', 'Exception', 'exception', 'Traceback', 'traceback',
+                                        'Failed', 'failed'])
                         
                         if has_error:
                             # 如果有错误，显示所有错误相关行
                             self.update_signal.emit("=" * 60)
-                            self.update_signal.emit("检测到错误信息，显示完整错误输出:")
+                            self.update_signal.emit("Error message detected, displaying full error output:")
                             self.update_signal.emit("=" * 60)
                             for line in output_lines:
                                 line_stripped = line.strip()
                                 if line_stripped:
                                     # 显示所有包含错误关键词的行
-                                    if any(keyword in line_stripped for keyword in 
+                                    if any(keyword in line_stripped for keyword in
                                           ['Error', 'error', 'Exception', 'exception', 'Traceback', 'traceback',
-                                           'Failed', 'failed', '失败', '错误', '异常', 'ImportError', 'ModuleNotFoundError']):
+                                           'Failed', 'failed', 'ImportError', 'ModuleNotFoundError']):
                                         self.update_signal.emit(line_stripped)
                             # 如果错误行太多，也显示其他重要行
                             if len(output_lines) > 20:
-                                self.update_signal.emit(f"... 还有{len(output_lines)}行输出")
+                                self.update_signal.emit(f"... {len(output_lines)} more lines of output")
                         else:
                             # 没有明显错误，按原逻辑处理
                             if len(output_lines) > 10:
-                                self.update_signal.emit(f"训练进程额外输出: {len(output_lines)}行")
+                                self.update_signal.emit(f"Training process additional output: {len(output_lines)} lines")
                                 # 显示前几行和最后几行
                                 for i, line in enumerate(output_lines[:5]):
                                     if line.strip():
                                         self.update_signal.emit(line.strip())
-                                self.update_signal.emit(f"... (省略{len(output_lines)-10}行) ...")
+                                self.update_signal.emit(f"... (omitting {len(output_lines)-10} lines) ...")
                                 for i, line in enumerate(output_lines[-5:]):
                                     if line.strip():
                                         self.update_signal.emit(line.strip())
@@ -2569,33 +3175,33 @@ class TrainingThread(QThread):
                                         self.update_signal.emit(line.strip())
                 
                 # 显示返回码和状态
-                self.update_signal.emit(f"MT_train.py执行完毕，返回码: {return_code}")
+                self.update_signal.emit(f"MT_train.py execution completed, return code: {return_code}")
                 if return_code != 0:
                     self.update_signal.emit("=" * 60)
-                    self.update_signal.emit(f"训练失败！返回码: {return_code}")
-                    self.update_signal.emit("请检查上面的错误信息以了解失败原因")
+                    self.update_signal.emit(f"Training failed! Return code: {return_code}")
+                    self.update_signal.emit("Please check the error messages above for failure reason")
                     self.update_signal.emit("=" * 60)
                 # 只有在真正训练完成时才将进度条设为100%
                 self.progress_signal.emit(100)
                  
                 # 如果没有捕获到任何输出，可能是执行路径问题
                 if not has_output:
-                    self.update_signal.emit("警告: 没有捕获到训练进程的任何输出，可能是执行路径或环境问题")
-                    self.update_signal.emit(f"请检查MT_train.py是否正确执行")
+                    self.update_signal.emit("Warning: No output captured from training process, may be execution path or environment issue")
+                    self.update_signal.emit(f"Please check if MT_train.py is executed correctly")
                  
                 # 根据返回码判断训练是否成功
                 if not self.signals_emitted:
                     if return_code == 0:
-                        self.update_signal.emit("训练成功完成！")
+                        self.update_signal.emit("Training completed successfully!")
                         self.training_finished.emit(True)
                     else:
-                        self.update_signal.emit(f"训练失败，返回码: {return_code}")
+                        self.update_signal.emit(f"Training failed, return code: {return_code}")
                         self.training_finished.emit(False)
                     self.signals_emitted = True
             except Exception as proc_error:
-                self.update_signal.emit(f"启动MT_train.py进程失败: {str(proc_error)}")
+                self.update_signal.emit(f"Failed to start MT_train.py process: {str(proc_error)}")
                 import traceback
-                self.update_signal.emit(f"错误详情: {traceback.format_exc()}")
+                self.update_signal.emit(f"Error details: {traceback.format_exc()}")
                 if not self.signals_emitted:
                     self.training_finished.emit(False)
                     self.signals_emitted = True
@@ -2603,9 +3209,9 @@ class TrainingThread(QThread):
                 # 确保线程结束时标记为已停止
                 self.was_stopped = True
         except Exception as outer_error:
-            self.update_signal.emit(f"训练过程中发生错误: {str(outer_error)}")
+            self.update_signal.emit(f"Error occurred during training: {str(outer_error)}")
             import traceback
-            self.update_signal.emit(f"外部错误详情: {traceback.format_exc()}")
+            self.update_signal.emit(f"External error details: {traceback.format_exc()}")
             if not self.signals_emitted:
                 self.training_finished.emit(False)
                 self.signals_emitted = True
@@ -2627,11 +3233,11 @@ class TrainingThread(QThread):
             import os
             # 使用绝对路径确保找到ParamConfig.py文件
             param_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ParamConfig.py')
-            self.update_signal.emit(f"使用ParamConfig.py路径: {param_config_path}")
+            self.update_signal.emit(f"Using ParamConfig.py path: {param_config_path}")
             
             # 读取当前ParamConfig.py内容
             if not os.path.exists(param_config_path):
-                self.update_signal.emit(f"警告: 找不到ParamConfig.py文件在路径: {param_config_path}")
+                self.update_signal.emit(f"Warning: ParamConfig.py file not found at path: {param_config_path}")
                 # 尝试创建一个默认的ParamConfig.py文件
                 self.create_default_param_config(param_config_path)
                 
@@ -2690,7 +3296,7 @@ ModelDir      = 'models/' # Model directory
 ResultDir     = 'results/' # Result directory
 Inchannels    = 1        # Number of input channels, i.e. the number of shots
 TestBatchSize = 8
-EarlyStop     = 0       # Early stopping threshold (0 means no early stopping)
+EarlyStop     = 10       # Early stopping threshold (0 means no early stopping)
 MT_Mode = 'TE'  # MT mode: 'TE', 'TM', or 'Both'
 '''
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -2742,40 +3348,118 @@ MT_Mode = 'TE'  # MT mode: 'TE', 'TM', or 'Both'
             # 记录错误但不抛出，确保stop方法不会失败
             self.update_signal.emit(f"Error during process termination: {str(e)}")
 
+
+def _write_pygimli_forward_script(script_path, dat_filename, length, depth, model_size):
+    """Write pyGIMLI compatible forward modeling script for .dat file."""
+    script_content = f'''# pyGIMLI 2D ERT forward modeling - load from exported .dat
+# Usage: python {os.path.basename(script_path)}  (run from same dir as .dat)
+# Requires: pygimli, numpy
+
+import os
+import numpy as np
+import pygimli as pg
+import pygimli.meshtools as mt
+from pygimli.physics import ert
+
+# 1. Load .dat (same directory as this script)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+dat_file = os.path.join(script_dir, "{dat_filename}")
+with open(dat_file) as f:
+    lines = [l for l in f if not l.strip().startswith('#')]
+params = [float(x) for x in lines[0].split()]
+nx, ny = int(params[0]), int(params[1])
+xmin, xmax, ymin, ymax = params[2], params[3], params[4], params[5]
+res = np.loadtxt(dat_file, skiprows=3).flatten()
+
+# 2. Create mesh (node positions for pg.createGrid)
+mesh = pg.createGrid(x=np.linspace(xmin, xmax, nx+1), y=np.linspace(ymin, ymax, ny+1))
+# Add boundary for ERT
+mesh = mt.appendTriangleBoundary(mesh, marker=1, xbound=50, ybound=50)
+# Extend res for boundary cells (background resistivity)
+res_mean = np.mean(res)
+res_full = np.concatenate([res, np.full(mesh.cellCount() - len(res), res_mean)])
+
+# 3. Define electrode scheme
+scheme = ert.createData(elecs=np.linspace(xmin, xmax, 21), schemeName='dd')
+
+# 4. Forward modeling
+data = ert.simulate(mesh, scheme=scheme, res=res_full, noiseLevel=0.01)
+data.save(dat_file.replace('.dat', '_simulated.dat'))
+print('Forward modeling done. Result saved to:', dat_file.replace('.dat', '_simulated.dat'))
+'''
+    try:
+        with open(script_path, 'w', encoding='utf-8') as f:
+            f.write(script_content)
+    except Exception:
+        pass  # ignore script write failure
+
+
 class PredictionTab(QWidget):
     """Model prediction and result export tab"""
+    VIS_TYPE_ORDER = ('model', 'resistivity', 'phase')
+    VIS_TYPE_ORDER_BOTH = ('model', 'te_resistivity', 'tm_resistivity', 'te_phase', 'tm_phase')
+    
     def __init__(self, parent=None):
         super(PredictionTab, self).__init__(parent)
-        self.prediction_data = None  # 存储预测数据
-        self.current_file_type = None  # 当前文件类型
-        self.current_folder = None  # 当前文件夹路径
-        # 初始化所有需要的列表控件，确保即使在旧方法中也能正常工作
+        self.prediction_data = None
+        self.current_file_type = None
+        self.current_folder = None
         self.data_file_list = QListWidget()
+        self.vis_state = {}  # {display_type: file_path} - same as DataImportTab
+        self.vis_dimensions = (5.0, 3.0)
         self.init_ui()
+        self._refresh_pred_show_all_button_caption()
+    
+    def _visual_type_order_pred(self):
+        return self.VIS_TYPE_ORDER_BOTH if self.both_radio.isChecked() else self.VIS_TYPE_ORDER
+    
+    def _visual_type_info_pred(self):
+        return {
+            'model': ('Inversion Resistivity Model', 'lgρ(Ω·m)', True),
+            'resistivity': ('Observed Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'phase': ('Observed Phase', 'φ(°)', False),
+            'te_resistivity': ('TE Observed Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'tm_resistivity': ('TM Observed Apparent Resistivity', 'lgρ(Ω·m)', True),
+            'te_phase': ('TE Observed Phase', 'φ(°)', False),
+            'tm_phase': ('TM Observed Phase', 'φ(°)', False),
+        }
+    
+    def _refresh_pred_show_all_button_caption(self):
+        if not hasattr(self, 'show_all_pred_button_right'):
+            return
+        if self.both_radio.isChecked():
+            self.show_all_pred_button_right.setText("Simultaneous View (Inversion Model + TE/TM Apparent Resistivity + TE/TM Phase)")
+        else:
+            self.show_all_pred_button_right.setText(
+                "Simultaneous View (Inversion Model + Apparent Resistivity + Phase)"
+            )
     
     def init_ui(self):
         """Initialize UI interface"""
         # Create main layout as horizontal layout
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
         
         # Left panel: Controls (with scroll area)
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
+        _pred_left_font = QFont()
+        _pred_left_font.setPointSize(9)
+        left_panel.setFont(_pred_left_font)
         
         model_group = QGroupBox("Model Loading")
         model_layout = QVBoxLayout()
         
         self.model_path_label = QLabel("No model file selected")
         self.model_path_label.setWordWrap(True)
-        self.model_path_label.setMinimumHeight(60)
+        self.model_path_label.setMinimumHeight(52)
         
         self.load_model_button = QPushButton("Load Model File")
         self.load_model_button.clicked.connect(self.load_model)
@@ -2850,19 +3534,19 @@ class PredictionTab(QWidget):
         # Create file path labels for each data type
         self.te_resistivity_label = QLabel("TE apparent resistivity: No file selected")
         self.te_resistivity_label.setWordWrap(True)
-        self.te_resistivity_label.setMinimumHeight(30)
+        self.te_resistivity_label.setMinimumHeight(26)
         
         self.te_phase_label = QLabel("TE phase: No file selected")
         self.te_phase_label.setWordWrap(True)
-        self.te_phase_label.setMinimumHeight(30)
+        self.te_phase_label.setMinimumHeight(26)
         
         self.tm_resistivity_label = QLabel("TM apparent resistivity: No file selected")
         self.tm_resistivity_label.setWordWrap(True)
-        self.tm_resistivity_label.setMinimumHeight(30)
+        self.tm_resistivity_label.setMinimumHeight(26)
         
         self.tm_phase_label = QLabel("TM phase: No file selected")
         self.tm_phase_label.setWordWrap(True)
-        self.tm_phase_label.setMinimumHeight(30)
+        self.tm_phase_label.setMinimumHeight(26)
         
         # Create horizontal layout for file lists
         lists_layout = QHBoxLayout()
@@ -2875,12 +3559,12 @@ class PredictionTab(QWidget):
         te_files_layout.setSpacing(8)
         
         self.te_resistivity_list = QListWidget()
-        self.te_resistivity_list.setMinimumHeight(120)
+        self.te_resistivity_list.setMinimumHeight(100)
         self.te_resistivity_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.te_resistivity_list.customContextMenuRequested.connect(lambda pos: self.show_data_context_menu(pos, self.te_resistivity_list))
         
         self.te_phase_list = QListWidget()
-        self.te_phase_list.setMinimumHeight(120)
+        self.te_phase_list.setMinimumHeight(100)
         self.te_phase_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.te_phase_list.customContextMenuRequested.connect(lambda pos: self.show_data_context_menu(pos, self.te_phase_list))
         
@@ -2896,12 +3580,12 @@ class PredictionTab(QWidget):
         tm_files_layout.setSpacing(8)
         
         self.tm_resistivity_list = QListWidget()
-        self.tm_resistivity_list.setMinimumHeight(120)
+        self.tm_resistivity_list.setMinimumHeight(100)
         self.tm_resistivity_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tm_resistivity_list.customContextMenuRequested.connect(lambda pos: self.show_data_context_menu(pos, self.tm_resistivity_list))
         
         self.tm_phase_list = QListWidget()
-        self.tm_phase_list.setMinimumHeight(120)
+        self.tm_phase_list.setMinimumHeight(100)
         self.tm_phase_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tm_phase_list.customContextMenuRequested.connect(lambda pos: self.show_data_context_menu(pos, self.tm_phase_list))
         
@@ -2916,7 +3600,7 @@ class PredictionTab(QWidget):
         
         self.predict_button = QPushButton("Start Prediction")
         self.predict_button.clicked.connect(self.start_prediction)
-        self.predict_button.setMinimumHeight(40)
+        self.predict_button.setMinimumHeight(34)
         
         data_layout.addLayout(mode_layout)
         data_layout.addSpacing(5)
@@ -2937,8 +3621,9 @@ class PredictionTab(QWidget):
         export_group = QGroupBox("Result Export")
         export_layout = QVBoxLayout()
         
-        self.export_result_button = QPushButton("Export Prediction Results")
+        self.export_result_button = QPushButton("Export Model (.dat / .grd)")
         self.export_result_button.clicked.connect(self.export_result)
+        self.export_result_button.setToolTip("Export 2D resistivity model to pyGIMLI (.dat) or Surfer (.grd) format")
         
         self.export_figure_button = QPushButton("Export Profile Diagram")
         self.export_figure_button.clicked.connect(self.export_figure)
@@ -2956,53 +3641,109 @@ class PredictionTab(QWidget):
         # Set scroll area widget
         left_scroll.setWidget(left_panel)
         
-        # Right panel: Prediction results (image area on right side)
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        right_column = QWidget()
+        right_column.setMinimumWidth(400)
+        right_column.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout = QVBoxLayout(right_column)
         right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(10)
-        
-        # Set style to ensure no extra margins or padding
-        right_panel.setStyleSheet("margin: 0px; padding: 0px;")
         
         self.result_title = QLabel("Predicted Resistivity Model Profile")
         self.result_title.setAlignment(Qt.AlignCenter)
         font = QFont()
-        font.setPointSize(12)
+        font.setPointSize(10)
         font.setBold(True)
         self.result_title.setFont(font)
-        # Remove any margin from title
         self.result_title.setMargin(0)
         
-        # Create result display canvas with wider dimensions as requested
-        self.result_canvas = MPLCanvas(self, width=10, height=16, dpi=100)
+        self.result_canvas = MPLCanvas(self, width=10, height=4, dpi=100)
+        # Match Data Import tab so the right column does not over-reserve height vs. buttons + messages below
+        self.result_canvas.setMinimumHeight(300)
+        self.result_canvas.setMinimumWidth(400)
+        self.result_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        result_plot_scroll = QScrollArea()
+        result_plot_scroll.setWidgetResizable(True)
+        result_plot_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        result_plot_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        result_plot_scroll.setWidget(self.result_canvas)
+        result_plot_scroll.setMinimumHeight(400)
+        result_plot_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        _configure_geophys_plot_scroll(result_plot_scroll)
         
         # Add message display area below canvas
         self.message_display = QTextEdit()
         self.message_display.setReadOnly(True)
         self.message_display.setPlaceholderText("Messages and results information will be displayed here...")
-        self.message_display.setMaximumHeight(100)
-        self.message_display.setStyleSheet("font-size: 10px;")
+        self.message_display.setMaximumHeight(88)
+        self.message_display.setStyleSheet("font-size: 9px;")
+        self.message_display.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.message_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
         # Add result file list below message area
         self.result_files_label = QLabel("Prediction Result Files:")
+        _pred_rff = QFont()
+        _pred_rff.setPointSize(9)
+        self.result_files_label.setFont(_pred_rff)
         self.result_files_list = QListWidget()
-        self.result_files_list.setMaximumHeight(80)
+        self.result_files_list.setMaximumHeight(72)
+        self.result_files_list.setFont(_pred_rff)
+        self.result_files_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.result_files_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_files_list.customContextMenuRequested.connect(lambda pos: self.show_result_file_context_menu(pos))
         
-        # Configure right layout
-        right_layout.setSpacing(10)  # 增加间距使布局更清晰
+        # Canvas operation buttons - same layout as Data Import tab (single-line row height so it does not intrude on the plot)
+        canvas_btn_layout = QHBoxLayout()
+        canvas_btn_layout.setContentsMargins(0, 8, 0, 0)
+        self.save_canvas_button = QPushButton("Save Image")
+        self.save_canvas_button.clicked.connect(self.save_prediction_canvas_image)
+        self.save_canvas_button.setToolTip("Save current visualization to file")
+        self.save_canvas_button.setDisabled(True)  # Enable when image is displayed, same as Data Import
+        self.show_all_pred_button_right = QPushButton("Simultaneous View (Inversion Model + Apparent Resistivity + Phase)")
+        self.show_all_pred_button_right.clicked.connect(self.visualize_all_prediction_results)
+        self.show_all_pred_button_right.setToolTip(
+            "Single mode: inversion model + apparent resistivity + phase; Both: up to 5 panels (model + TE/TM apparent resistivity + phase), same layout as Data Import."
+        )
+        self.show_all_pred_button_right.setStyleSheet("padding: 4px 8px; font-size: 9pt; background-color: #2196F3; color: white; border: none; border-radius: 4px;")
+        self.clear_pred_vis_button_right = QPushButton("Clear")
+        self.clear_pred_vis_button_right.clicked.connect(self.clear_prediction_visualization)
+        _pred_canvas_btn_max_h = 34
+        _pred_btn_font = QFont()
+        _pred_btn_font.setPointSize(9)
+        for _btn in (self.save_canvas_button, self.show_all_pred_button_right, self.clear_pred_vis_button_right):
+            _btn.setFont(_pred_btn_font)
+            _btn.setMaximumHeight(_pred_canvas_btn_max_h)
+            _btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        canvas_btn_layout.addWidget(self.save_canvas_button)
+        canvas_btn_layout.addWidget(self.show_all_pred_button_right)
+        canvas_btn_layout.addWidget(self.clear_pred_vis_button_right)
+        
+        operation_label = QLabel(
+            "Instructions: When the figure is larger than the panel, use the scrollbars or mouse wheel to move up/down and left/right "
+            "(Shift+wheel for horizontal); Ctrl+wheel zooms the axes under the cursor; left drag to pan; right click to save image."
+        )
+        operation_label.setWordWrap(True)
+        operation_label.setAlignment(Qt.AlignCenter)
+        operation_label.setStyleSheet("font-size: 9px; color: gray;")
+        
         right_layout.addWidget(self.result_title)
-        right_layout.addWidget(self.result_canvas)
+        right_layout.addWidget(result_plot_scroll, 1)
+        right_layout.addSpacing(16)
+        right_layout.addLayout(canvas_btn_layout)
+        right_layout.addWidget(operation_label)
         right_layout.addWidget(self.message_display)
         right_layout.addWidget(self.result_files_label)
         right_layout.addWidget(self.result_files_list)
-        right_layout.addStretch(1)  # Add stretch at bottom to push content up
         
-        # Add panels to main layout - controls on left, image area on right
-        main_layout.addWidget(left_scroll, 1)  # 使用滚动区域
-        main_layout.addWidget(right_panel, 2)  # Image area gets more space
+        left_scroll.setMinimumWidth(380)
+        pred_splitter = QSplitter(Qt.Horizontal)
+        pred_splitter.addWidget(left_scroll)
+        pred_splitter.addWidget(right_column)
+        _configure_import_prediction_splitter(pred_splitter)
+        pred_splitter.setSizes([460, 660])
+        self.pred_plot_splitter = pred_splitter
+        main_layout.addWidget(pred_splitter)
+        QTimer.singleShot(0, self._ensure_pred_splitter_ratio_once)
         
         self.setLayout(main_layout)
         
@@ -3015,6 +3756,20 @@ class PredictionTab(QWidget):
         # Call on_mode_changed to set initial button states based on default TE selection
         self.on_mode_changed()
     
+    def _ensure_pred_splitter_ratio_once(self):
+        if getattr(self, '_pred_splitter_ratio_applied', False):
+            return
+        sp = getattr(self, 'pred_plot_splitter', None)
+        if not sp or sp.width() < 400:
+            return
+        # Narrower left / wider plot column than Data Import (default splitter further left)
+        _apply_import_pred_splitter_ratio(sp, 0.38)
+        self._pred_splitter_ratio_applied = True
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._ensure_pred_splitter_ratio_once()
+
     def load_specific_file_type(self, mode, data_type):
         """Load specific type of data file (TE/TM and resistivity/phase)"""
         # Define file filters based on mode and data type
@@ -3111,6 +3866,8 @@ class PredictionTab(QWidget):
         model_type = "Unknown"
         if "DinkNet" in model_name or "Dnet" in model_name:
             model_type = "DinkNet"
+        elif "UnetPlusPlus" in model_name or "unetplusplus" in model_name.lower():
+            model_type = "UNet++"
         elif "Unet" in model_name:
             model_type = "U-Net"
         elif "Seg" in model_name:
@@ -3190,6 +3947,12 @@ class PredictionTab(QWidget):
             self.import_tm_resistivity_button.setStyleSheet(tm_button_style)
             self.import_tm_phase_button.setEnabled(True)
             self.import_tm_phase_button.setStyleSheet(tm_button_style)
+        self._refresh_pred_show_all_button_caption()
+        if self.vis_state:
+            try:
+                self._redraw_prediction_visualization()
+            except Exception:
+                pass
     
     def update_data_file_list(self):
         """Update data file list based on current mode and loaded data"""
@@ -3220,8 +3983,8 @@ class PredictionTab(QWidget):
             file_name = os.path.basename(file_path)
             
             # Determine data type (resistivity or phase) based on file name
-            data_type = ('resistivity' if ('RES' in file_name.upper() or 'RHO' in file_name.upper() or '视电阻率' in file_name)
-                        else 'phase' if ('PHASE' in file_name.upper() or 'PHS' in file_name.upper() or '相位' in file_name)
+            data_type = ('resistivity' if ('RES' in file_name.upper() or 'RHO' in file_name.upper() or 'APPARENT' in file_name.upper())
+                        else 'phase' if ('PHASE' in file_name.upper() or 'PHS' in file_name.upper())
                         else None)
             
             # Determine mode (TE or TM) based on file name
@@ -3285,275 +4048,145 @@ class PredictionTab(QWidget):
                 file_path = list_widget.currentItem().data(Qt.UserRole)
                 data_type = list_widget.currentItem().data(Qt.UserRole + 1)
                 mode = list_widget.currentItem().data(Qt.UserRole + 2) if list_widget.currentItem().data(Qt.UserRole + 2) else "Unknown"
-                self.visualize_specific_file(file_path, data_type, mode)
+                self.visualize_specific_file(file_path, data_type=data_type, mode=mode)
     
-    def visualize_specific_file(self, file_path, data_type=None, mode="Unknown"):
-        """Visualize specific data file"""
-        # Read file data and process as required
-        file_name = os.path.basename(file_path)
-        
-        # 尝试查找对应的配置文件来获取实际的数据维度
-        # 配置文件通常与结果文件在同一目录，名称格式为 pred_config_*.json
-        config_dir = os.path.dirname(file_path)
-        base_filename = os.path.splitext(file_name)[0].replace('pred_', '')
-        
-        # 默认维度
-        model_size = 32
-        
-        # 尝试查找对应的配置文件
-        try:
-            # 查找匹配的配置文件
-            import glob
-            config_files = glob.glob(os.path.join(config_dir, f"pred_config_*{base_filename}*.json"))
-            if config_files:
-                # 读取第一个匹配的配置文件
-                with open(config_files[0], 'r', encoding='utf-8') as f:
-                    import json
-                    config = json.load(f)
-                    if 'data_dim' in config and isinstance(config['data_dim'], list) and len(config['data_dim']) == 2:
-                        # 取最大的维度作为重塑尺寸
-                        model_size = max(config['data_dim'])
-        except Exception as e:
-            # 配置文件读取失败，继续使用默认值
-            pass
-        
-        try:
-            # Create custom dialog for user to input both model length and depth
-            class ModelSizeDialog(QDialog):
-                def __init__(self, parent=None):
-                    super().__init__(parent)
-                    self.setWindowTitle("Model Size Input")
-                    self.setFixedSize(300, 150)
-                    
-                    layout = QVBoxLayout(self)
-                    
-                    # Create length input
-                    length_layout = QHBoxLayout()
-                    length_label = QLabel("Model Length (km):")
-                    self.length_spin = QDoubleSpinBox()
-                    self.length_spin.setRange(0.1, 100.0)
-                    self.length_spin.setDecimals(1)
-                    self.length_spin.setValue(5.0)  # Default value
-                    length_layout.addWidget(length_label)
-                    length_layout.addWidget(self.length_spin)
-                    
-                    # Create depth input
-                    depth_layout = QHBoxLayout()
-                    depth_label = QLabel("Model Depth (km):")
-                    self.depth_spin = QDoubleSpinBox()
-                    self.depth_spin.setRange(0.1, 50.0)
-                    self.depth_spin.setDecimals(1)
-                    self.depth_spin.setValue(3.0)  # Default value
-                    depth_layout.addWidget(depth_label)
-                    depth_layout.addWidget(self.depth_spin)
-                    
-                    # Create buttons
-                    button_layout = QHBoxLayout()
-                    ok_button = QPushButton("OK")
-                    cancel_button = QPushButton("Cancel")
-                    ok_button.clicked.connect(self.accept)
-                    cancel_button.clicked.connect(self.reject)
-                    button_layout.addWidget(ok_button)
-                    button_layout.addWidget(cancel_button)
-                    
-                    # Add to main layout
-                    layout.addLayout(length_layout)
-                    layout.addLayout(depth_layout)
-                    layout.addLayout(button_layout)
-                    
-            # Show dialog and get user input
-            dialog = ModelSizeDialog(self)
-            if dialog.exec_() == QDialog.Accepted:
-                length = dialog.length_spin.value()
-                depth = dialog.depth_spin.value()
-            else:
-                # User canceled input
-                return
-            
-            # 检查是否为Both模式的4通道数据文件
-            is_both_mode_file = False
-            channel_data = []
-            
-            # 尝试读取文件并检查是否有通道标记
-            with open(file_path, 'r') as f:
-                lines = f.readlines()
-                if any('# Channel' in line for line in lines):
-                    is_both_mode_file = True
-                    
-                    # 分割文件内容为不同通道
-                    current_channel = []
-                    for line in lines:
-                        if '# Channel' in line:
-                            if current_channel:
-                                # 保存当前通道数据
-                                channel_data.append(np.array(current_channel))
-                                current_channel = []
-                        elif line.strip() != '':  # 跳过空行
-                            # 解析数值行
-                            values = [float(v) for v in line.strip().split()]
-                            current_channel.extend(values)
-                    # 保存最后一个通道
-                    if current_channel:
-                        channel_data.append(np.array(current_channel))
-            
-            # 如果是Both模式的多通道文件，让用户选择要可视化的通道
-            if is_both_mode_file and len(channel_data) > 1:
-                # 创建通道选择对话框
-                class ChannelSelectionDialog(QDialog):
-                    def __init__(self, parent=None):
-                        super().__init__(parent)
-                        self.setWindowTitle("Select Channel")
-                        self.setFixedSize(250, 150)
-                        
-                        layout = QVBoxLayout(self)
-                        
-                        # 创建通道选择标签
-                        label = QLabel("Select channel to visualize:")
-                        layout.addWidget(label)
-                        
-                        # 创建通道选择下拉框
-                        self.channel_combo = QComboBox()
-                        channel_options = [
-                            "Channel 1: TE Resistivity",
-                            "Channel 2: TE Phase",
-                            "Channel 3: TM Resistivity",
-                            "Channel 4: TM Phase"
-                        ]
-                        self.channel_combo.addItems(channel_options)
-                        layout.addWidget(self.channel_combo)
-                        
-                        # 创建按钮
-                        button_layout = QHBoxLayout()
-                        ok_button = QPushButton("OK")
-                        cancel_button = QPushButton("Cancel")
-                        ok_button.clicked.connect(self.accept)
-                        cancel_button.clicked.connect(self.reject)
-                        button_layout.addWidget(ok_button)
-                        button_layout.addWidget(cancel_button)
-                        
-                        # 添加到主布局
-                        layout.addLayout(button_layout)
-                    
-                    def get_selected_channel(self):
-                        return self.channel_combo.currentIndex()
-                    
-                # 显示通道选择对话框
-                channel_dialog = ChannelSelectionDialog(self)
-                if channel_dialog.exec_() == QDialog.Accepted:
-                    selected_channel_index = channel_dialog.get_selected_channel()
-                    if 0 <= selected_channel_index < len(channel_data):
-                        data = channel_data[selected_channel_index]
-                        # 更新模式和数据类型信息
-                        if selected_channel_index in [0, 2]:  # 电阻率通道
-                            data_type = "resistivity"
-                        else:  # 相位通道
-                            data_type = "phase"
-                        if selected_channel_index in [0, 1]:  # TE模式通道
-                            mode = "TE"
-                        else:  # TM模式通道
-                            mode = "TM"
-                else:
-                    # User canceled channel selection
+    def _show_model_size_dialog_pred(self):
+        """Show model size dialog for prediction tab."""
+        class ModelSizeDialog(QDialog):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("Section physical extent")
+                self.setFixedSize(360, 200)
+                layout = QVBoxLayout(self)
+                tip = QLabel(
+                    "Enter profile length and maximum depth (km) for the inversion model or observation data.\n"
+                    "The canvas fills this rectangle; multi-panel layout matches the Data Import tab."
+                )
+                tip.setWordWrap(True)
+                layout.addWidget(tip)
+                length_layout = QHBoxLayout()
+                length_layout.addWidget(QLabel("Profile length (km):"))
+                self.length_spin = QDoubleSpinBox()
+                self.length_spin.setRange(0.1, 100.0)
+                self.length_spin.setValue(5.0)
+                length_layout.addWidget(self.length_spin)
+                depth_layout = QHBoxLayout()
+                depth_layout.addWidget(QLabel("Maximum depth (km):"))
+                self.depth_spin = QDoubleSpinBox()
+                self.depth_spin.setRange(0.1, 50.0)
+                self.depth_spin.setValue(3.0)
+                depth_layout.addWidget(self.depth_spin)
+                btn_layout = QHBoxLayout()
+                ok_btn = QPushButton("OK")
+                cancel_btn = QPushButton("Cancel")
+                ok_btn.clicked.connect(self.accept)
+                cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(ok_btn)
+                btn_layout.addWidget(cancel_btn)
+                layout.addLayout(length_layout)
+                layout.addLayout(depth_layout)
+                layout.addLayout(btn_layout)
+        dialog = ModelSizeDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            return (dialog.length_spin.value(), dialog.depth_spin.value())
+        return None
+    
+    def _redraw_prediction_visualization(self):
+        """Redraw canvas from vis_state: same order as Data Import, Both uses five panels and layout."""
+        if not self.vis_state:
+            return
+        _normalize_geophys_vis_state(
+            self.vis_state,
+            self.both_radio.isChecked(),
+            self.te_radio.isChecked(),
+            self.tm_radio.isChecked(),
+        )
+        length, depth = self.vis_dimensions
+        num_ticks = 5
+        type_info = self._visual_type_info_pred()
+        plots = []
+        for dt in self._visual_type_order_pred():
+            if dt in self.vis_state:
+                fp = self.vis_state[dt]
+                title, cbar_label, is_res = type_info[dt]
+                try:
+                    data = self._load_prediction_plot_data(
+                        fp, is_res, 32, transpose_like_mt_input=(dt != "model")
+                    )
+                    plots.append((data, f"{title}\n{os.path.basename(fp)}", cbar_label))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to load {fp}: {e}")
                     return
-            else:
-                # 读取普通格式的文件数据
-                if not is_both_mode_file:
-                    data = np.loadtxt(file_path)
-                elif len(channel_data) > 0:
-                    # 如果是Both模式但只有一个通道，或用户取消了选择，使用第一个通道
-                    data = channel_data[0]
-            
-            # 修复数据重塑逻辑，确保与数据导入标签页一致
-            # 首先检查数据形状，如果是一维数组，需要重塑
-            if len(data.shape) == 1:
-                # 对于一维数据，根据数据长度重塑为合适的形状
-                size = int(np.sqrt(data.size))
-                # 找到最接近的合适尺寸
-                data = data[:size*size].reshape(size, size)
-            else:
-                # 如果已经是二维数组，确保形状正确
-                if data.shape != (model_size, model_size):
-                    data = data[:model_size, :model_size]
-            
-            # Determine whether to apply logarithm based on file type
-            # For apparent resistivity files, always apply logarithm
-            # For phase files, do not apply logarithm
-            # 注意：预测结果文件保存时已经还原为原始电阻率（通过10的幂次转换）
-            # 所以可视化时需要再次进行log10转换
-            is_resistivity = ('res' in file_name.lower() or 'rho' in file_name.lower() or 
-                              '视电阻率' in file_name or data_type == 'resistivity' or
-                              'pred_' in file_name.lower())
-            if is_resistivity:
-                # 对于预测结果文件，数据已经是原始电阻率值，需要log10转换
-                # First take absolute value to ensure no negative values, then add a small value to avoid log10(0)
-                data = np.log10(np.abs(data) + 1e-10)
-                print(f"Applied log10 transformation for visualization. Data range: {data.min():.3f} - {data.max():.3f} (lgρ)")
-            
-            # Visualize processed data
-            # Reset figure more thoroughly: clear all axes and recreate main axis
-            self.result_canvas.figure.clear()
-            
-            # 重新创建主坐标轴
-            self.result_canvas.axes = self.result_canvas.figure.add_subplot(111)
-            
-            # Adjust figure aspect ratio based on user-input length and depth
-            # Calculate actual aspect ratio and set reasonable limits (between 0.5 and 2 to avoid overly flat or elongated figures)
-            aspect_ratio = min(max(depth / length, 0.5), 2.0)
-            im = self.result_canvas.axes.imshow(data, cmap='jet', aspect=aspect_ratio, origin='upper')
-            
-            # Add colorbar and limit number of ticks to 3-4
-            # Create a colorbar that matches the image heights
-            cbar = self.result_canvas.figure.colorbar(im, ax=self.result_canvas.axes, shrink=0.4)
-            
-            # Set colorbar label based on data type
-            if data_type == 'resistivity':
-                cbar.set_label('lgρ(Ω·m)')  # Resistivity unit (log scaled)
-            else:
-                cbar.set_label('φ(°)')  # Phase unit
+        if not plots:
+            return
+        n = len(plots)
+        axes_list = _create_axes_for_plot_count(self.result_canvas.figure, n)
+        cb_kw = _geophys_colorbar_kwargs(n)
+        title_fs = 8 if n >= 5 else 10
+        for i, (data, title, cbar_label) in enumerate(plots):
+            ax = axes_list[i]
+            im = _draw_geophysical_section(ax, data, length, depth, cmap='jet_r', num_ticks=num_ticks)
+            cbar = self.result_canvas.figure.colorbar(im, ax=ax, **cb_kw)
+            cbar.set_label(cbar_label, fontsize=9 if n >= 3 else 10)
+            cbar.ax.tick_params(labelsize=8 if n >= 3 else 9)
             cbar.locator = plt.MaxNLocator(nbins=4)
             cbar.update_ticks()
-            
-            # Set title with mode information
-            if data_type == 'resistivity':
-                data_type_text = f"Predicted Data: {file_name} "
+            ax.set_title(title, fontsize=title_fs)
+        _finalize_figure_layout(self.result_canvas.figure, n)
+        self.result_canvas.draw()
+        _apply_geophys_canvas_pixel_size(self.result_canvas)
+        self.save_canvas_button.setEnabled(True)
+    
+    def save_prediction_canvas_image(self):
+        """Save current canvas visualization - same as Data Import."""
+        if self.result_canvas.save_figure():
+            QMessageBox.information(self, "Success", "Image saved successfully!")
+    
+    def clear_prediction_visualization(self):
+        """Clear all visualizations and reset canvas."""
+        self.vis_state.clear()
+        self.result_canvas.figure.clear()
+        self.result_canvas.axes = self.result_canvas.figure.add_subplot(111)
+        self.result_canvas.axes.set_xticks([])
+        self.result_canvas.axes.set_yticks([])
+        self.result_canvas.axes.set_xlabel('')
+        self.result_canvas.axes.set_ylabel('')
+        self.result_canvas.axes.set_title('')
+        self.result_canvas.figure.tight_layout()
+        self.result_canvas.draw()
+        _reset_geophys_canvas_pixel_size(self.result_canvas, min_w=450, min_h=540)
+        self.save_canvas_button.setEnabled(False)
+        self.result_title.setText("Predicted Resistivity Model Profile")
+    
+    def visualize_specific_file(self, file_path, data_type=None, mode="Unknown", display_type=None):
+        """Same as Data Import: in Both mode TE/TM each use separate subplot slots."""
+        file_name = os.path.basename(file_path)
+        if display_type is None:
+            if mode == "Prediction Result":
+                display_type = 'model'
+            elif self.both_radio.isChecked() and mode in ('TE', 'TM'):
+                if data_type == 'resistivity':
+                    display_type = 'te_resistivity' if mode == 'TE' else 'tm_resistivity'
+                else:
+                    display_type = 'te_phase' if mode == 'TE' else 'tm_phase'
             else:
-                data_type_text = f"Predicted Data: {file_name} "
-            
-            # Set centered title with larger font size
-            self.result_canvas.axes.set_title(data_type_text, loc='center', fontsize=20)
-            
-            # Set axis ticks and labels to display user-input model dimensions
-            # x-axis (horizontal) represents length, y-axis (vertical) represents depth
-            num_ticks = 5  # Set number of ticks
-            x_ticks = np.linspace(0, model_size-1, num_ticks)
-            y_ticks = np.linspace(0, model_size-1, num_ticks)
-            
-            # Calculate corresponding actual dimension values
-            x_tick_labels = [f"{x:.1f}" for x in np.linspace(0, length, num_ticks)]
-            y_tick_labels = [f"{y:.1f}" for y in np.linspace(0, depth, num_ticks)]
-            
-            # Set tick positions and labels with larger font size
-            self.result_canvas.axes.set_xticks(x_ticks)
-            self.result_canvas.axes.set_yticks(y_ticks)
-            self.result_canvas.axes.set_xticklabels(x_tick_labels, fontsize=18)
-            self.result_canvas.axes.set_yticklabels(y_tick_labels, fontsize=18)
-            
-            # Set tick parameters font size
-            self.result_canvas.axes.tick_params(axis='both', labelsize=18)
-            
-            # Set axis labels with larger font size
-            self.result_canvas.axes.set_xlabel('Length (km)', fontsize=20)
-            self.result_canvas.axes.set_ylabel('Depth (km)', fontsize=20)
-            
-            # Adjust layout to ensure all elements are displayed correctly
-            self.result_canvas.figure.tight_layout()
-            
-            # Redraw the canvas
-            self.result_canvas.draw()
-            
-            # Update the result title
+                display_type = 'resistivity' if data_type == 'resistivity' else 'phase'
+        
+        if not self.vis_state:
+            dims = self._show_model_size_dialog_pred()
+            if dims is None:
+                return
+            self.vis_dimensions = dims
+            self.vis_state[display_type] = file_path
+        else:
+            if display_type in self.vis_state:
+                self.vis_state[display_type] = file_path
+            else:
+                self.vis_state[display_type] = file_path
+        
+        try:
+            self._redraw_prediction_visualization()
             self.result_title.setText(f"Data Visualization: {file_name}")
-            
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Cannot visualize file {file_name}: {str(e)}")
     
@@ -3701,6 +4334,203 @@ class PredictionTab(QWidget):
         self.export_result_button.setEnabled(True)
         self.export_figure_button.setEnabled(True)
     
+    def _load_prediction_plot_data(self, file_path, is_resistivity, model_size=32, transpose_like_mt_input=False):
+        """Load prediction/observation data for plotting; supports multi-channel Both format.
+        transpose_like_mt_input: True for observed apparent resistivity/phase (same .T after ensure as MT_test.load_test_data); False for inversion model plot.
+        """
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+        
+        if any('# Channel' in line for line in lines):
+            channel_data = []
+            current_channel = []
+            for line in lines:
+                if '# Channel' in line:
+                    if current_channel:
+                        channel_data.append(np.array(current_channel))
+                        current_channel = []
+                elif line.strip() != '':
+                    values = [float(v) for v in line.strip().split()]
+                    current_channel.extend(values)
+            if current_channel:
+                channel_data.append(np.array(current_channel))
+            # 模型用第1通道(TE电阻率)，观测视电阻率/相位用对应通道
+            data = channel_data[0] if channel_data else np.array([])
+        else:
+            data = np.loadtxt(file_path)
+        
+        data = _ensure_data_dim_grid(data)
+        if transpose_like_mt_input:
+            data = np.asarray(data).T
+        if is_resistivity:
+            data = np.log10(np.abs(data) + 1e-10)
+        return data
+    
+    def visualize_all_prediction_results(self):
+        """Show inversion model with observed apparent resistivity and phase; Both mode up to 5 panels."""
+        if not self.result_files_list.count():
+            QMessageBox.warning(self, "Notice", "Please complete prediction first, or select an inversion model file from the result list.")
+            return
+        
+        model_path = None
+        if self.result_files_list.currentItem():
+            model_path = self.result_files_list.currentItem().data(Qt.UserRole)
+        else:
+            model_path = self.result_files_list.item(0).data(Qt.UserRole)
+        
+        both = self.both_radio.isChecked()
+        if self.te_radio.isChecked():
+            res_list, phase_list = self.te_resistivity_list, self.te_phase_list
+        elif self.tm_radio.isChecked():
+            res_list, phase_list = self.tm_resistivity_list, self.tm_phase_list
+        else:
+            res_list, phase_list = self.te_resistivity_list, self.te_phase_list
+        
+        te_res_path = te_ph_path = tm_res_path = tm_ph_path = None
+        res_path = phase_path = None
+        
+        if both:
+            _idx_b, te_res_path, te_ph_path, tm_res_path, tm_ph_path = _both_mode_resolve_te_tm_paths(
+                self.te_resistivity_list,
+                self.te_phase_list,
+                self.tm_resistivity_list,
+                self.tm_phase_list,
+            )
+        else:
+            idx = 0
+            if res_list.currentItem():
+                idx = res_list.row(res_list.currentItem())
+            elif phase_list.currentItem():
+                idx = phase_list.row(phase_list.currentItem())
+            res_item = res_list.item(idx) if res_list.count() > idx else None
+            phase_item = phase_list.item(idx) if phase_list.count() > idx else None
+            res_path = res_item.data(Qt.UserRole) if res_item else None
+            phase_path = phase_item.data(Qt.UserRole) if phase_item else None
+        
+        if not model_path or not os.path.exists(model_path):
+            QMessageBox.warning(self, "Notice", "Inversion model file is invalid or does not exist.")
+            return
+        
+        if both:
+            if not any([te_res_path, te_ph_path, tm_res_path, tm_ph_path]):
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    "In Both mode, load TE/TM apparent resistivity or phase files before using simultaneous view.",
+                )
+                return
+        elif not res_path and not phase_path:
+            QMessageBox.warning(self, "Notice", "Please load observation data (apparent resistivity and phase) before using simultaneous view.")
+            return
+        
+        class ModelSizeDialog(QDialog):
+            def __init__(self, parent=None, both_mode=False):
+                super().__init__(parent)
+                self.setWindowTitle("Section physical extent")
+                self.setFixedSize(380, 220)
+                layout = QVBoxLayout(self)
+                tip_txt = (
+                    "Extent (km) for inversion model and observations. Both mode shows up to 5 panels."
+                    if both_mode
+                    else "Enter profile length and depth (km) for inversion model and observations.\nThe canvas fills this rectangle."
+                )
+                tip = QLabel(tip_txt)
+                tip.setWordWrap(True)
+                layout.addWidget(tip)
+                length_layout = QHBoxLayout()
+                length_layout.addWidget(QLabel("Profile length (km):"))
+                self.length_spin = QDoubleSpinBox()
+                self.length_spin.setRange(0.1, 100.0)
+                self.length_spin.setValue(5.0)
+                length_layout.addWidget(self.length_spin)
+                depth_layout = QHBoxLayout()
+                depth_layout.addWidget(QLabel("Maximum depth (km):"))
+                self.depth_spin = QDoubleSpinBox()
+                self.depth_spin.setRange(0.1, 50.0)
+                self.depth_spin.setValue(3.0)
+                depth_layout.addWidget(self.depth_spin)
+                btn_layout = QHBoxLayout()
+                ok_btn = QPushButton("OK")
+                cancel_btn = QPushButton("Cancel")
+                ok_btn.clicked.connect(self.accept)
+                cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(ok_btn)
+                btn_layout.addWidget(cancel_btn)
+                layout.addLayout(length_layout)
+                layout.addLayout(depth_layout)
+                layout.addLayout(btn_layout)
+        
+        dialog = ModelSizeDialog(self, both_mode=both)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        length = dialog.length_spin.value()
+        depth = dialog.depth_spin.value()
+        
+        plots = []
+        
+        try:
+            model_data = self._load_prediction_plot_data(model_path, True, 32)
+            plots.append((model_data, f"Inversion Resistivity Model\n{os.path.basename(model_path)}", 'lgρ(Ω·m)'))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load inversion model: {e}")
+            return
+        
+        if both:
+            obs_specs = [
+                (te_res_path, True, "TE Observed Apparent Resistivity", 'lgρ(Ω·m)'),
+                (tm_res_path, True, "TM Observed Apparent Resistivity", 'lgρ(Ω·m)'),
+                (te_ph_path, False, "TE Observed Phase", 'φ(°)'),
+                (tm_ph_path, False, "TM Observed Phase", 'φ(°)'),
+            ]
+            for pth, is_res, ttl, clab in obs_specs:
+                if not pth or not os.path.exists(pth):
+                    continue
+                try:
+                    arr = self._load_prediction_plot_data(pth, is_res, 32, transpose_like_mt_input=True)
+                    plots.append((arr, f"{ttl}\n{os.path.basename(pth)}", clab))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to load {pth}: {e}")
+        else:
+            if res_path and os.path.exists(res_path):
+                try:
+                    res_data = self._load_prediction_plot_data(res_path, True, 32, transpose_like_mt_input=True)
+                    plots.append((res_data, f"Observed Apparent Resistivity\n{os.path.basename(res_path)}", 'lgρ(Ω·m)'))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to load apparent resistivity: {e}")
+            if phase_path and os.path.exists(phase_path):
+                try:
+                    phase_data = self._load_prediction_plot_data(phase_path, False, 32, transpose_like_mt_input=True)
+                    plots.append((phase_data, f"Observed Phase\n{os.path.basename(phase_path)}", 'φ(°)'))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to load phase: {e}")
+        
+        if len(plots) < 2:
+            QMessageBox.warning(self, "Notice", "At least inversion model and one type of observation data are required for simultaneous display.")
+            return
+        
+        n_plots = len(plots)
+        axes_list = _create_axes_for_plot_count(self.result_canvas.figure, n_plots)
+        cb_kw = _geophys_colorbar_kwargs(n_plots)
+        title_fs = 8 if n_plots >= 5 else 10
+        num_ticks = 5
+        
+        for i, (data, title, cbar_label) in enumerate(plots):
+            ax = axes_list[i]
+            im = _draw_geophysical_section(ax, data, length, depth, cmap='jet_r', num_ticks=num_ticks)
+            cbar = self.result_canvas.figure.colorbar(im, ax=ax, **cb_kw)
+            cbar.set_label(cbar_label, fontsize=9 if n_plots >= 3 else 10)
+            cbar.ax.tick_params(labelsize=8 if n_plots >= 3 else 9)
+            cbar.locator = plt.MaxNLocator(nbins=4)
+            cbar.update_ticks()
+            ax.set_title(title, fontsize=title_fs)
+        
+        _finalize_figure_layout(self.result_canvas.figure, n_plots)
+        self.result_canvas.draw()
+        _apply_geophys_canvas_pixel_size(self.result_canvas)
+        self.save_canvas_button.setEnabled(True)
+        self.result_title.setText("Simultaneous View: Inversion Model + Observation Data")
+    
     def export_result(self):
         """Export prediction results"""
         # Check if there is a selected result file
@@ -3716,16 +4546,30 @@ class PredictionTab(QWidget):
             QMessageBox.warning(self, "Warning", "Selected result file does not exist.")
             return
         
-        # Open save file dialog
+        # Open save file dialog with format options
         options = QFileDialog.Options()
-        file, _ = QFileDialog.getSaveFileName(
-            self, "Export Prediction Results", "", "Data Files (*.dat);;All Files (*)", options=options
+        file, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export 2D Resistivity Model",
+            "",
+            "pyGIMLI compatible (*.dat);;Surfer Grid (*.grd);;Plain text (*.txt);;All Files (*)",
+            options=options
         )
         
         if file:
+            # Determine format from filter or file extension
+            if "pyGIMLI" in (selected_filter or "") or "*.dat" in (selected_filter or "") or file.lower().endswith('.dat'):
+                file = file if file.lower().endswith('.dat') else file + '.dat'
+                export_format = 'dat'
+            elif "Surfer" in (selected_filter or "") or "*.grd" in (selected_filter or "") or file.lower().endswith('.grd'):
+                file = file if file.lower().endswith('.grd') else file + '.grd'
+                export_format = 'grd'
+            else:
+                export_format = 'txt'
+            
+            # Get model dimensions (use cached)
+            length, depth = self.vis_dimensions
+            model_size = 32
             try:
-                model_size = 32
-                
                 # 检查是否为Both模式的4通道数据文件
                 is_both_mode_file = False
                 channel_data = []
@@ -3815,26 +4659,55 @@ class PredictionTab(QWidget):
                 
                 # Ensure data is properly shaped
                 if data.size != model_size * model_size:
-                    # If data size doesn't match, try to reshape as best as possible
                     data = data[:model_size*model_size].reshape((model_size, model_size))
                 else:
                     data = data.reshape((model_size, model_size))
                 
-                # Export the complete 32x32 data
-                with open(file, 'w') as f:
-                    # Optional header comment
-                    f.write("# Predicted resistivity model data\n")
-                    f.write("# Format: 32 values per line, separated by spaces\n")
-                    
-                    # Export each row with 32 values separated by spaces
-                    for i in range(model_size):
-                        # Create a list of 32 values for this row
-                        row_values = [f"{data[i, j]:.6f}" for j in range(model_size)]
-                        # Join with a single space and write to file
-                        f.write(' '.join(row_values) + '\n')
+                # Resistivity (Ohm.m): assume linear; if log10 (max<10), convert
+                rho = np.abs(data) + 1e-10
+                if rho.max() < 10:
+                    rho = np.power(10, data)
                 
-                # Display export success message
-                self.model_info.append(f"\nResults exported to: {file}")
+                # Export based on format
+                with open(file, 'w') as f:
+                    if export_format == 'grd':
+                        # Surfer 6 ASCII grid format (DSAA)
+                        # Row order: first row = ylo (surface), last = yhi (max depth)
+                        # data[0,:] = surface, data[-1,:] = max depth
+                        z_min, z_max = float(rho.min()), float(rho.max())
+                        f.write("DSAA\n")
+                        f.write(f"{model_size} {model_size}\n")
+                        f.write(f"0.0 {length}\n")
+                        f.write(f"0.0 {depth}\n")
+                        f.write(f"{z_min} {z_max}\n")
+                        for i in range(model_size):
+                            row_vals = [f"{rho[i, j]:.6e}" for j in range(model_size)]
+                            f.write(' '.join(row_vals) + '\n')
+                    elif export_format == 'dat':
+                        # pyGIMLI forward modeling ready: header + cell-order resistivity
+                        # Header: nx ny xmin xmax ymin ymax (km) - matches pg.createGrid node positions
+                        # Resistivity in cell order: row-major (depth i, then x j) = mesh.cellCount()
+                        f.write("# pyGIMLI 2D resistivity model - ready for ert.simulate()\n")
+                        f.write("# Format: nx ny xmin xmax ymin ymax (km)\n")
+                        f.write(f"{model_size} {model_size} 0.0 {length:.6f} 0.0 {depth:.6f}\n")
+                        for i in range(model_size):
+                            row_vals = [f"{rho[i, j]:.6e}" for j in range(model_size)]
+                            f.write(' '.join(row_vals) + '\n')
+                        # Export companion forward modeling script
+                        dat_dir = os.path.dirname(file)
+                        dat_base = os.path.splitext(os.path.basename(file))[0]
+                        script_path = os.path.join(dat_dir, dat_base + "_forward.py") if dat_dir else (dat_base + "_forward.py")
+                        _write_pygimli_forward_script(script_path, os.path.basename(file), length, depth, model_size)
+                        self.model_info.append(f"  + Forward script: {script_path}")
+                    else:
+                        # Plain text: 32 values per line
+                        f.write("# Predicted resistivity model (Ohm.m)\n")
+                        f.write(f"# Length={length}km Depth={depth}km\n")
+                        for i in range(model_size):
+                            row_values = [f"{rho[i, j]:.6e}" for j in range(model_size)]
+                            f.write(' '.join(row_values) + '\n')
+                
+                self.model_info.append(f"\nExported to {export_format.upper()}: {file}")
                 
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to export results: {str(e)}")
@@ -3859,14 +4732,7 @@ class PredictionTab(QWidget):
         if action == visualize_action:
             file_path = self.result_files_list.currentItem().data(Qt.UserRole)
             if file_path and os.path.exists(file_path):
-                # Clear the canvas
-                self.result_canvas.clear()
-                
-                # Try to visualize the file
-                self.visualize_specific_file(file_path, data_type="resistivity", mode="Prediction Result")
-                
-                # Update the result title
-                self.result_title.setText(f"Visualization of: {os.path.basename(file_path)}")
+                self.visualize_specific_file(file_path, display_type='model')
 
 class MTDLPyMainWindow(QMainWindow):
     """MTDLPy main window"""
@@ -3903,7 +4769,8 @@ class MTDLPyMainWindow(QMainWindow):
         self.tabs.addTab(self.model_tab, "Param Config")
         self.tabs.addTab(self.training_tab, "Model Training")
         self.tabs.addTab(self.prediction_tab, "Model Prediction")
-        
+        self.tabs.tabBar().setExpanding(True)  # Expand tabs to fill width, prevent label truncation
+
         # 设置标签页的初始启用状态
         self.tabs.setTabEnabled(1, False)  # Model Config (disabled until data is imported)
         self.tabs.setTabEnabled(2, False)  # Model Training (disabled until model is configured)
@@ -4152,12 +5019,12 @@ class MTDLPyMainWindow(QMainWindow):
             color: #757575;
             border: 1px solid #E0E0E0;
             border-bottom: none;
-            padding: 10px 20px;
+            padding: 10px 24px;
             margin-right: 2px;
             border-top-left-radius: 6px;
             border-top-right-radius: 6px;
             font-size: 9pt;
-            min-width: 100px;
+            min-width: 140px;
         }
         
         QTabBar::tab:selected {

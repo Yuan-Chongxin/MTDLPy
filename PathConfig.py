@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-文件位置设置
+Path layout.
 
-创建于2021年7月
+Created July 2021.
 
-作者：ycx
+Author: ycx
 
 """
 

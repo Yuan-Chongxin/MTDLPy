@@ -41,15 +41,9 @@ import time
 
 def load_model(model_type='DinkNet', model_path=None):
     """
-    加载模型，根据模型文件名自动推断模型类型、MT模式和输入通道数
-    
-    参数:
-    - model_type: 模型类型（'DinkNet'或'UnetModel'），如果为None则从文件名推断
-    - model_path: 模型文件路径
-    
-    返回:
-    - net: 加载的模型
-    - model_file: 模型文件路径
+    Load network; infer model type, MT mode, and input channel count from filename when possible.
+
+    Returns (net, model_file).
     """
     # Here indicating the GPU you want to use. if you don't have GPU, just leave it.
     cuda_available = torch.cuda.is_available()
@@ -89,6 +83,10 @@ def load_model(model_type='DinkNet', model_path=None):
             
             net = DinkNet50(num_classes=Nclasses, num_channels=num_channels)
             print(f"Use DinkNet50 model, input channels: {num_channels}")
+            
+        elif 'UnetPlusPlus' in model_file or 'unetplusplus' in model_file.lower() or 'UNet++' in model_file:
+            net = UNetPlusPlus(num_classes=Nclasses, num_channels=num_channels)
+            print(f"Use UNetPlusPlus model, input channels: {num_channels}")
             
         elif 'Unet' in model_file or 'UNet' in model_file or 'unet' in model_file.lower():
             # Unet模型使用从文件名推断的通道数
@@ -153,6 +151,18 @@ def load_model(model_type='DinkNet', model_path=None):
             print(f"Detected MT mode from filename, using {num_channels} input channels for UnetModel")
             net = UnetModel(n_classes=Nclasses, in_channels=num_channels)
             print(f"Use UnetModel, input channels: {num_channels}")
+            
+        elif model_type == 'UnetPlusPlus':
+            model_files = [f for f in os.listdir(models_dir) if ('UnetPlusPlus' in f or 'unetplusplus' in f.lower()) and f.endswith('.pkl')]
+            if model_files:
+                model_file = max([os.path.join(models_dir, f) for f in model_files], key=os.path.getmtime)
+            else:
+                model_file = os.path.join(models_dir, "UnetPlusPlus_TrainSize0.01_Epoch30_BatchSize8_LR00001.pkl")
+            model_filename = os.path.basename(model_file)
+            num_channels = 4 if 'ModeBoth' in model_filename else 2
+            print(f"Detected MT mode from filename, using {num_channels} input channels for UnetPlusPlus")
+            net = UNetPlusPlus(num_classes=Nclasses, num_channels=num_channels)
+            print(f"Use UNetPlusPlus model, input channels: {num_channels}")
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
     
@@ -165,7 +175,7 @@ def load_model(model_type='DinkNet', model_path=None):
         raise FileNotFoundError(f"Model file not found: {model_file}")
     except RuntimeError as e:
         error_msg = str(e)
-        print(f"模型加载错误: {error_msg}")
+        print(f"Model load error: {error_msg}")
         
         # 如果出现size mismatch错误，可能是输入通道数不匹配
         if 'size mismatch' in error_msg and ('firstconv.weight' in error_msg or 'weight' in error_msg):
@@ -189,6 +199,8 @@ def load_model(model_type='DinkNet', model_path=None):
                             net = DinkNet50(num_classes=Nclasses, num_channels=try_ch)
                         elif model_class_name == 'UnetModel':
                             net = UnetModel(n_classes=Nclasses, in_channels=try_ch)
+                        elif model_class_name == 'UNetPlusPlus':
+                            net = UNetPlusPlus(num_classes=Nclasses, num_channels=try_ch)
                         else:
                             break
                         
@@ -198,11 +210,11 @@ def load_model(model_type='DinkNet', model_path=None):
                         break
                     except RuntimeError as e2:
                         if try_ch == try_channels[-1]:  # 最后一次尝试
-                            raise RuntimeError(f"无法加载模型权重，尝试了所有通道数配置: {error_msg}")
+                            raise RuntimeError(f"Failed to load weights after trying all channel configs: {error_msg}")
                         continue
         else:
             # 其他类型的错误，直接抛出
-            raise RuntimeError(f"无法加载模型权重: {error_msg}")
+            raise RuntimeError(f"Failed to load model weights: {error_msg}")
     
     # 将模型移至GPU（如果可用）
     if torch.cuda.is_available():
@@ -211,35 +223,51 @@ def load_model(model_type='DinkNet', model_path=None):
     return net, model_file
 
 
+def infer_net_input_channels(net):
+    """Infer first-layer input channels from loaded weights (avoids assuming 2 ch when filename lacks ModeBoth)."""
+    name = net.__class__.__name__
+    if name == 'DinkNet50':
+        return int(net.firstconv.weight.shape[1])
+    if name == 'UnetModel':
+        return int(net.in_channels)
+    if name == 'UNetPlusPlus':
+        return int(net.num_channels)
+    if hasattr(net, 'firstconv') and hasattr(net.firstconv, 'weight'):
+        return int(net.firstconv.weight.shape[1])
+    raise RuntimeError(f'Cannot infer input channels from network type {name}')
+
+
+def normalize_gui_mt_mode(argv_val):
+    """Normalize GUI argv TE/TM/BOTH to strings used by load_test_data."""
+    if argv_val is None or str(argv_val).strip() == '':
+        return None
+    s = str(argv_val).strip()
+    u = s.upper()
+    if u == 'BOTH':
+        return 'Both'
+    if u == 'TE':
+        return 'TE'
+    if u == 'TM':
+        return 'TM'
+    return s
+
+
 ################################################
 ########    LOADING TESTING DATA       ########
 ################################################
 
-# 导入训练数据加载模块中的降采样函数
+# 导入训练数据加载模块中的降采样函数与空间网格预处理（与训练一致）
 from skimage.measure import block_reduce
+from func.DataLoad_Train import ensure_grid_shape, _get_raw_grid_shape
 
 def decimate(a, axis):
-    """
-    降采样函数，与训练时使用的函数完全一致
-    直接返回块的平均值
-    """
+    """Downsample block mean; same as training."""
     return np.mean(a, axis=axis)
 
 def validate_test_data(resistivity_data, phase_data=None, file_id='test', mode='TE'):
     """
-    校验视电阻率和相位数据是否有效（与DataLoad_Train.py中的validate_data函数保持一致）
-    
-    参数:
-    - resistivity_data: 视电阻率数据
-    - phase_data: 相位数据（可选）
-    - file_id: 文件标识
-    - mode: 模式（'TE'或'TM'）
-    
-    返回:
-    - 布尔值：数据是否有效
-    - 列表：错误信息
-    - 处理后的视电阻率数据
-    - 处理后的相位数据（如果提供）
+    Validate apparent resistivity and phase (aligned with DataLoad_Train.validate_data).
+    Returns valid, invalid_info, resistivity_data, phase_data.
     """
     invalid_info = []
     valid = True
@@ -247,39 +275,29 @@ def validate_test_data(resistivity_data, phase_data=None, file_id='test', mode='
     # 检查视电阻率数据是否有负数或异常值（与训练时一致）
     if np.any(np.logical_or(resistivity_data <= 0, resistivity_data >= 100000)):
         valid = False
-        invalid_info.append(f"{mode}视电阻率数据包含负数或异常值")
+        invalid_info.append(f"{mode} apparent resistivity has non-positive or out-of-range values")
         # 修复：将无效值限制在有效范围内
         resistivity_data = np.maximum(resistivity_data, 1e-6)
         resistivity_data = np.minimum(resistivity_data, 99999)
-        print(f"已自动修复{mode}视电阻率数据中的无效值")
+        print(f"Clamped invalid {mode} apparent resistivity values")
     
     # 检查相位数据是否在0-90之间（如果提供，与训练时一致）
     if phase_data is not None:
         if np.any(phase_data < 0) or np.any(phase_data > 90):
             valid = False
-            invalid_info.append(f"{mode}相位数据值不在0-90区间")
+            invalid_info.append(f"{mode} phase values outside [0, 90]")
             # 修复：将无效值限制在有效范围内
             phase_data = np.maximum(phase_data, 0)
             phase_data = np.minimum(phase_data, 90)
-            print(f"已自动修复{mode}相位数据中的无效值")
+            print(f"Clamped invalid {mode} phase values")
     
     return valid, invalid_info, resistivity_data, phase_data
 
 def load_test_data(test_data_file=None, mt_mode='TM'):
     """
-    加载测试数据，与训练流程完全一致
-    
-    关键：确保每一步都与DataLoad_Train.py中的处理完全一致
-    
-    参数:
-    - test_data_file: 测试数据文件路径（视电阻率文件）
-    - mt_mode: MT模式（'TE'、'TM'或'Both'）
-    
-    返回:
-    - test_set: 测试数据集，形状为(1, in_channels, data_dsp_dim[0] * data_dsp_dim[1]) - 与训练时完全一致
-    - data_dsp_dim: 降采样后的数据维度
-    - label_dsp_dim: 标签输出维度
-    - file_info: 文件信息字典
+    Load test tensors with the same pipeline as training (see DataLoad_Train).
+
+    Returns test_set, data_dsp_dim, label_dsp_dim, file_info.
     """
     print('***************** Loading Testing DataSet *****************')
     
@@ -313,6 +331,12 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
     if expected_channels != Inchannels:
         print(f"Warning: MT mode {mt_mode} requires {expected_channels} channels, but Inchannels={Inchannels}. Adjusting...")
         Inchannels = expected_channels
+
+    # 与训练一致：目标网格来自 DataDim；原始行列来自 ParamConfig.RawGridShape（无需预测时再输入）
+    _raw_gs = _get_raw_grid_shape()
+    if 'DataDim' not in globals() or DataDim is None:
+        DataDim = [32, 32]
+    _th, _tw = int(DataDim[0]), int(DataDim[1])
     
     if test_data_file is not None and test_data_file and os.path.exists(test_data_file):
         # 使用指定的测试数据文件
@@ -345,19 +369,19 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
                     raw_phase = np.loadtxt(phase_file, encoding='utf-8')
                 else:
                     print(f"Warning: Phase file not found: {phase_file}, using zeros for phase channel")
-                    raw_phase = np.zeros(1024)  # 1024 = 32*32
+                    raw_phase = np.zeros_like(np.asarray(raw_resistivity), dtype=np.float64)
                 
                 # 步骤2：数据预处理（与训练时完全一致）
-                # 2.1 reshape为(32,32)然后转置（与DataLoad_Train.py第113行一致）
-                print(f"Step 2.1: Reshape to (32,32) and transpose")
-                train_data1 = np.reshape(raw_resistivity, (32, 32)).T
-                train_data2 = np.reshape(raw_phase, (32, 32)).T
+                # 2.1 原始网格先插值到 DataDim，再转置（与 DataLoad_Train.ensure_grid_shape 一致）
+                print(f"Step 2.1: Resize to DataDim=({_th}, {_tw}) then transpose (RawGridShape={_raw_gs})")
+                train_data1 = ensure_grid_shape(raw_resistivity, (_th, _tw), _raw_gs).T
+                train_data2 = ensure_grid_shape(raw_phase, (_th, _tw), _raw_gs).T
                 
                 # 2.2 数据验证（与训练时一致）
                 print(f"Step 2.2: Validate data")
                 valid, invalid_info, train_data1, train_data2 = validate_test_data(train_data1, train_data2, file_base, mt_mode)
                 if not valid:
-                    print(f"警告: 数据校验发现问题:")
+                    print(f"Warning: validation issues:")
                     for info in invalid_info:
                         print(f"  - {info}")
                 
@@ -390,7 +414,7 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
                     else:
                         data_set = np.append(data_set, data11_set, axis=0)
                 
-                print(f"Data downsampled from (32, 32) to {data_dsp_dim} with block size {data_dsp_blk}")
+                print(f"Data downsampled from ({_th}, {_tw}) to {data_dsp_dim} with block size {data_dsp_blk}")
                 print(f"Data set shape after processing: {data_set.shape} (channels, flattened)")
                 
                 # 2.7 组织为最终格式（与训练时完全一致）
@@ -426,23 +450,25 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
                 
                 # 读取所有数据
                 raw_te_resistivity = np.loadtxt(te_resistivity_file, encoding='utf-8')
-                raw_te_phase = np.loadtxt(te_phase_file, encoding='utf-8') if te_phase_file and os.path.exists(te_phase_file) else np.zeros(1024)
-                raw_tm_resistivity = np.loadtxt(tm_resistivity_file, encoding='utf-8') if tm_resistivity_file and os.path.exists(tm_resistivity_file) else np.zeros(1024)
-                raw_tm_phase = np.loadtxt(tm_phase_file, encoding='utf-8') if tm_phase_file and os.path.exists(tm_phase_file) else np.zeros(1024)
+                _te0 = np.asarray(raw_te_resistivity, dtype=np.float64)
+                raw_te_phase = np.loadtxt(te_phase_file, encoding='utf-8') if te_phase_file and os.path.exists(te_phase_file) else np.zeros_like(_te0)
+                raw_tm_resistivity = np.loadtxt(tm_resistivity_file, encoding='utf-8') if tm_resistivity_file and os.path.exists(tm_resistivity_file) else np.zeros_like(_te0)
+                _tm0 = np.asarray(raw_tm_resistivity, dtype=np.float64)
+                raw_tm_phase = np.loadtxt(tm_phase_file, encoding='utf-8') if tm_phase_file and os.path.exists(tm_phase_file) else np.zeros_like(_tm0)
                 
                 # 步骤2：数据预处理（与训练流程完全一致）
-                # 2.1 reshape和转置
-                train_data1 = np.reshape(raw_te_resistivity, (32, 32)).T
-                train_data2 = np.reshape(raw_te_phase, (32, 32)).T
-                train_data3 = np.reshape(raw_tm_resistivity, (32, 32)).T
-                train_data4 = np.reshape(raw_tm_phase, (32, 32)).T
+                # 2.1 插值到 DataDim 后转置
+                train_data1 = ensure_grid_shape(raw_te_resistivity, (_th, _tw), _raw_gs).T
+                train_data2 = ensure_grid_shape(raw_te_phase, (_th, _tw), _raw_gs).T
+                train_data3 = ensure_grid_shape(raw_tm_resistivity, (_th, _tw), _raw_gs).T
+                train_data4 = ensure_grid_shape(raw_tm_phase, (_th, _tw), _raw_gs).T
                 
                 # 2.2 数据验证
                 valid_te, invalid_info_te, train_data1, train_data2 = validate_test_data(train_data1, train_data2, file_base, 'TE')
                 valid_tm, invalid_info_tm, train_data3, train_data4 = validate_test_data(train_data3, train_data4, file_base, 'TM')
                 
                 if not valid_te or not valid_tm:
-                    print(f"警告: 数据校验发现问题:")
+                    print(f"Warning: validation issues:")
                     if not valid_te:
                         for info in invalid_info_te:
                             print(f"  - {info}")
@@ -472,7 +498,7 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
                     else:
                         data_set = np.append(data_set, data11_set, axis=0)
                 
-                print(f"Data downsampled from (32, 32) to {data_dsp_dim} with block size {data_dsp_blk}")
+                print(f"Data downsampled from ({_th}, {_tw}) to {data_dsp_dim} with block size {data_dsp_blk}")
                 
                 # 2.5 组织为最终格式
                 test_set = data_set.reshape(1, Inchannels, data_dsp_dim[0] * data_dsp_dim[1])
@@ -515,13 +541,13 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
                 
         except Exception as e:
             print(f"Failed to load test data file: {test_data_file}", e)
-            error_msg = f"无法加载指定的测试数据文件: {test_data_file}\n"
-            error_msg += f"详细错误信息: {str(e)}"
+            error_msg = f"Failed to load test data file: {test_data_file}\n"
+            error_msg += f"Detail: {str(e)}"
             raise RuntimeError(error_msg)
     else:
         # 如果没有指定测试数据文件，尝试从数据目录中查找
-        error_msg = "错误: 必须提供有效的测试数据文件路径\n"
-        error_msg += "请在运行程序时指定测试数据文件"
+        error_msg = "Error: a valid test data file path is required\n"
+        error_msg += "Pass the test data file when running this script"
         print(error_msg)
         raise RuntimeError(error_msg)
 
@@ -531,12 +557,7 @@ def load_test_data(test_data_file=None, mt_mode='TM'):
 ################################################
 def predict(net, test_set, data_dsp_dim, label_dsp_dim):
     """
-    进行预测，确保与训练时的数据处理完全一致
-    
-    关键点：
-    1. 输入数据格式：训练时是 (batch, channels, data_dsp_dim[0] * data_dsp_dim[1]) - flatten的1D
-    2. 训练时reshape: images.view(batch, channels, label_dsp_dim[0], label_dsp_dim[1])
-    3. 模型输出格式：与标签格式一致 (batch, Nclasses, label_dsp_dim[0], label_dsp_dim[1])
+    Run forward pass; tensor layout matches training (flattened input then view to label_dsp_dim).
     """
     
     print() 
@@ -561,30 +582,30 @@ def predict(net, test_set, data_dsp_dim, label_dsp_dim):
     
     # 添加详细的调试信息
     print(f"\n{'='*60}")
-    print(f"输入数据统计信息:")
+    print(f"Input statistics:")
     print(f"{'='*60}")
-    print(f"  原始test_set shape: {test_set.shape}")
-    print(f"  期望格式: (samples, channels, flattened_data)")
-    print(f"  数据值范围: 最小={np.min(test_set):.6f}, 最大={np.max(test_set):.6f}")
-    print(f"  数据均值: {np.mean(test_set):.6f}, 标准差: {np.std(test_set):.6f}")
+    print(f"  raw test_set shape: {test_set.shape}")
+    print(f"  expected: (samples, channels, flattened_data)")
+    print(f"  value range: min={np.min(test_set):.6f}, max={np.max(test_set):.6f}")
+    print(f"  mean: {np.mean(test_set):.6f}, std: {np.std(test_set):.6f}")
     
     # 分别检查每个通道的数据范围
     for ch in range(test_set.shape[1]):
         ch_data = test_set[0, ch]
-        print(f"  通道{ch+1} (flattened, length={len(ch_data)}):")
-        print(f"    最小={ch_data.min():.6f}, 最大={ch_data.max():.6f}")
-        print(f"    均值={ch_data.mean():.6f}, 标准差={ch_data.std():.6f}")
+        print(f"  channel {ch+1} (flattened, length={len(ch_data)}):")
+        print(f"    min={ch_data.min():.6f}, max={ch_data.max():.6f}")
+        print(f"    mean={ch_data.mean():.6f}, std={ch_data.std():.6f}")
         # 如果是第一个通道（通常是电阻率，已经log10转换），显示对应的原始电阻率范围
         if ch == 0:
             if ch_data.min() > -20 and ch_data.max() < 20:
                 orig_min = 10 ** ch_data.min()
                 orig_max = 10 ** ch_data.max()
-                print(f"    对应原始电阻率范围: {orig_min:.2e} - {orig_max:.2e} Ω·m")
+                print(f"    approx. linear resistivity range: {orig_min:.2e} - {orig_max:.2e} Ohm·m")
     
-    print(f"  模型类型: {model_class_name}")
-    print(f"  计算设备: {device}")
-    print(f"  数据降采样维度: {data_dsp_dim}")
-    print(f"  标签降采样维度: {label_dsp_dim}")
+    print(f"  model: {model_class_name}")
+    print(f"  device: {device}")
+    print(f"  data_dsp_dim: {data_dsp_dim}")
+    print(f"  label_dsp_dim: {label_dsp_dim}")
     print(f"{'='*60}\n")
     
     # ========== 关键：与训练时完全一致的reshape ==========
@@ -633,11 +654,11 @@ def predict(net, test_set, data_dsp_dim, label_dsp_dim):
     # 进行预测
     with torch.no_grad():  
         # 检查模型类型，根据不同模型类型传入正确的参数
-        if 'Unet' in model_class_name:
-            # UNet模型需要两个参数：图像和label_dsp_dim
+        if model_class_name == 'UnetModel':
+            # UnetModel需要两个参数：图像和label_dsp_dim
             outputs = net(test_tensor, label_dsp_dim)
         else:
-            # DinkNet等其他模型只需要一个参数：图像
+            # DinkNet、UNetPlusPlus等模型只需要一个参数：图像
             outputs = net(test_tensor)
         
         print(f"Model output shape: {outputs.shape}")
@@ -705,7 +726,7 @@ def predict(net, test_set, data_dsp_dim, label_dsp_dim):
         
         # 打印详细的预测结果统计信息
         print("\n" + "="*60)
-        print("预测结果统计信息（模型原始输出，log10格式）:")
+        print("Prediction stats (model output, log10 resistivity):")
         print("="*60)
         for i in range(predictions.shape[0]):
             pred_2d = predictions[i]
@@ -713,17 +734,17 @@ def predict(net, test_set, data_dsp_dim, label_dsp_dim):
             current_max = pred_2d.max()
             current_mean = pred_2d.mean()
             current_std = pred_2d.std()
-            print(f"通道{i+1}原始预测范围（log10格式，lgρ）:")
-            print(f"  最小={current_min:.6f}, 最大={current_max:.6f}")
-            print(f"  均值={current_mean:.6f}, 标准差={current_std:.6f}")
-            print(f"  形状={pred_2d.shape}")
+            print(f"channel {i+1} log10 range:")
+            print(f"  min={current_min:.6f}, max={current_max:.6f}")
+            print(f"  mean={current_mean:.6f}, std={current_std:.6f}")
+            print(f"  shape={pred_2d.shape}")
             
             # 计算对应的电阻率范围（用于参考）
             if current_min > -20 and current_max < 20:
                 resistivity_min = 10 ** current_min
                 resistivity_max = 10 ** current_max
-                print(f"  对应原始电阻率范围: {resistivity_min:.2e} - {resistivity_max:.2e} Ω·m")
-                print(f"  注意：这是模型输出的log10格式预测值，保存时会转换为原始电阻率")
+                print(f"  approx. linear resistivity: {resistivity_min:.2e} - {resistivity_max:.2e} Ohm·m")
+                print(f"  (saved file converts log10 to linear resistivity)")
         print("="*60 + "\n")
     
     # 记录耗时
@@ -733,21 +754,35 @@ def predict(net, test_set, data_dsp_dim, label_dsp_dim):
     return predictions
 
 
+def _apply_prediction_spatial_fix_2d(arr):
+    """
+    Apply ParamConfig.PredictionOutputSpatialFix (transpose/rotate) before saving, to match map/orientation conventions.
+    """
+    if arr is None or not hasattr(arr, 'ndim') or arr.ndim != 2:
+        return arr
+    try:
+        from ParamConfig import PredictionOutputSpatialFix as fix
+    except (ImportError, AttributeError):
+        fix = 'none'
+    fix = (fix or 'none').strip().lower()
+    if fix == 'none' or fix == '':
+        return arr
+    if fix == 'transpose':
+        return np.ascontiguousarray(arr.T)
+    if fix in ('rot90_cw', 'rot90_clockwise', 'cw'):
+        return np.ascontiguousarray(np.rot90(arr, k=-1))
+    if fix in ('rot90_ccw', 'ccw'):
+        return np.ascontiguousarray(np.rot90(arr, k=1))
+    print(f"Warning: unknown PredictionOutputSpatialFix={fix!r}, ignored.")
+    return arr
+
+
 ################################################
 ########          SAVE RESULTS          ########
 ################################################
 def save_prediction_results(predictions, file_info, data_dsp_dim):
     """
-    保存预测结果到文件
-    
-    参数:
-    - predictions: 预测结果（log10格式）
-    - file_info: 数据文件信息
-    - data_dsp_dim: 数据降采样维度
-    
-    返回:
-    - result_file_path: 保存的结果文件路径
-    - config_file_path: 保存的配置信息文件路径
+    Write prediction grids to results_dir; returns (result_file_path, config_file_path).
     """
     # 创建结果目录（如果不存在）
     os.makedirs(results_dir, exist_ok=True)
@@ -774,6 +809,7 @@ def save_prediction_results(predictions, file_info, data_dsp_dim):
                     channel_data = np.clip(channel_data, 1e-8, 1e8)
                 else:  # 相位通道
                     channel_data = predictions[i]
+                channel_data = _apply_prediction_spatial_fix_2d(channel_data)
                 np.savetxt(f, channel_data, fmt='%.6f')
                 if i < min(4, len(predictions)) - 1:
                     f.write('\n')
@@ -786,17 +822,18 @@ def save_prediction_results(predictions, file_info, data_dsp_dim):
         restored_predictions = np.power(10, limited_predictions)
         # 进一步限制结果范围
         restored_predictions = np.clip(restored_predictions, 1e-8, 1e8)
+        restored_predictions = _apply_prediction_spatial_fix_2d(restored_predictions)
         print(f"\n{'='*60}")
-        print("保存预测结果时的数据转换:")
+        print("Save pipeline (log10 -> linear):")
         print(f"{'='*60}")
-        print(f"模型输出（log10格式，lgρ）:")
-        print(f"  最小={predictions[0].min():.6f}, 最大={predictions[0].max():.6f}")
-        print(f"限制后（log10格式，lgρ）:")
-        print(f"  最小={limited_predictions.min():.6f}, 最大={limited_predictions.max():.6f}")
-        print(f"还原后（原始电阻率，Ω·m）:")
-        print(f"  最小={restored_predictions.min():.6e}, 最大={restored_predictions.max():.6e}")
-        print(f"还原后（log10格式，用于验证）:")
-        print(f"  最小={np.log10(restored_predictions.min()):.6f}, 最大={np.log10(restored_predictions.max()):.6f}")
+        print(f"model output (log10):")
+        print(f"  min={predictions[0].min():.6f}, max={predictions[0].max():.6f}")
+        print(f"after clip (log10):")
+        print(f"  min={limited_predictions.min():.6f}, max={limited_predictions.max():.6f}")
+        print(f"linear resistivity (Ohm·m):")
+        print(f"  min={restored_predictions.min():.6e}, max={restored_predictions.max():.6e}")
+        print(f"log10 of linear (check):")
+        print(f"  min={np.log10(restored_predictions.min()):.6f}, max={np.log10(restored_predictions.max()):.6f}")
         print(f"{'='*60}\n")
         np.savetxt(result_file_path, restored_predictions, fmt='%.6f')
     
@@ -842,6 +879,8 @@ def main():
                 model_filename = os.path.basename(selected_model_path)
                 if 'DinkNet' in model_filename or 'dinknet' in model_filename.lower():
                     model_type = 'DinkNet'
+                elif 'UnetPlusPlus' in model_filename or 'unetplusplus' in model_filename.lower():
+                    model_type = 'UnetPlusPlus'
                 elif 'Unet' in model_filename or 'unet' in model_filename.lower():
                     model_type = 'UnetModel'
                 else:
@@ -854,30 +893,45 @@ def main():
         
         # 调用load_model函数
         net, model_file = load_model(model_type=model_type, model_path=selected_model_path)
+        model_in_ch = infer_net_input_channels(net)
+        print(f"Inferred model input channels from weights: {model_in_ch}")
         
-        # 2. 确定MT模式（优先使用模型文件名中的MT模式）
-        mt_mode = 'TM'  # 默认TM模式
-        
-        # 首先尝试从模型文件名中提取MT模式
+        # 2. 确定 MT 模式：必须以「已加载网络的输入通道数」为准，文件名 / GUI 仅作 TE/TM 细分
+        mt_mode = 'TM'  # 默认 TM（2 通道时与文件名/GUI 再对齐）
         if selected_model_path:
             model_filename = os.path.basename(selected_model_path)
             if 'ModeTE' in model_filename:
                 mt_mode = 'TE'
-                print(f"MT mode extracted from model filename: {mt_mode}")
+                print(f"MT mode hint from model filename: {mt_mode}")
             elif 'ModeTM' in model_filename:
                 mt_mode = 'TM'
-                print(f"MT mode extracted from model filename: {mt_mode}")
+                print(f"MT mode hint from model filename: {mt_mode}")
             elif 'ModeBoth' in model_filename:
                 mt_mode = 'Both'
-                print(f"MT mode extracted from model filename: {mt_mode}")
+                print(f"MT mode hint from model filename: {mt_mode}")
         
-        # 如果命令行参数提供了MT模式，且与模型文件名中的不一致，给出警告
-        if len(sys.argv) > 3 and sys.argv[3]:
-            gui_mt_mode = sys.argv[3]
-            if gui_mt_mode != mt_mode:
-                print(f"Warning: MT mode from GUI ({gui_mt_mode}) differs from model file ({mt_mode}). Using model file mode: {mt_mode}")
+        gui_mt_mode = normalize_gui_mt_mode(sys.argv[3] if len(sys.argv) > 3 else None)
+        
+        if model_in_ch == 4:
+            mt_mode = 'Both'
+            if gui_mt_mode and gui_mt_mode != 'Both':
+                print(
+                    f"Note: Model requires 4 input channels; loading test data in Both (TE+TM) layout. "
+                    f"GUI mode {gui_mt_mode} does not change channel count."
+                )
+        elif model_in_ch == 2:
+            if gui_mt_mode in ('TE', 'TM'):
+                mt_mode = gui_mt_mode
+                print(f"Using MT mode from GUI for 2-channel model: {mt_mode}")
+            elif gui_mt_mode == 'Both':
+                raise RuntimeError(
+                    "This model uses 2 input channels; it is incompatible with Both mode. "
+                    "Use a 4-channel model (filename with ModeBoth) or select TE/TM in the GUI."
+                )
             else:
-                print(f"MT mode from GUI matches model file: {mt_mode}")
+                print(f"Using MT mode from model filename (2-channel model): {mt_mode}")
+        else:
+            print(f"Warning: Unusual model input channel count: {model_in_ch}")
         
         # 3. 加载测试数据
         test_data_file = None

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-网络训练
+Network training.
 
-创建于2021年7月
+Created July 2021.
 
-作者：ycx
+Author: ycx
 
 """
 
@@ -25,22 +25,23 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 添加详细的环境信息打印
 print("[DEBUG INFO]")
-print(f"PyTorch版本: {torch.__version__}")
-print(f"CUDA可用: {torch.cuda.is_available()}")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"CUDA设备: {torch.cuda.get_device_name(0)}")
-    print(f"CUDA内存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-print(f"NumPy版本: {np.__version__}")
-print(f"Python版本: {sys.version}")
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+print(f"NumPy version: {np.__version__}")
+print(f"Python version: {sys.version}")
 print("[DEBUG INFO END]")
 print()
 
 # 导入自定义模块
-print("[DEBUG] 开始导入自定义模块...")
+print("[DEBUG] Importing custom modules...")
 import func.DataLoad_Train as DLTrain
 from func.dinknet import DinkNet50
-print("[DEBUG] 已导入DataLoad_Train和DinkNet50")
-print("[DEBUG] 所有自定义模块导入完成")
+from func.unetplusplus import UNetPlusPlus
+print("[DEBUG] Imported DataLoad_Train, DinkNet50, UNetPlusPlus")
+print("[DEBUG] Custom module import finished")
 
 # 确保我们可以正常运行，即使配置模块导入失败
 try:
@@ -48,9 +49,9 @@ try:
     from PathConfig import *
     from LibConfig import *
     CONFIG_MODULES_AVAILABLE = True
-    print(f'[MT_TRAIN] 成功导入配置模块')
+    print(f'[MT_TRAIN] ParamConfig imported OK')
 except ImportError as e:
-    print(f'[MT_TRAIN] 警告: 导入配置模块失败: {e}')
+    print(f'[MT_TRAIN] WARNING: ParamConfig import failed: {e}')
     CONFIG_MODULES_AVAILABLE = False
     # 设置默认值以确保程序能继续运行
     ReUse = True
@@ -91,32 +92,32 @@ except ImportError as e:
     # UsePhysicsConstraint parameter has been removed
 
 # 打印配置信息
-print(f"[DEBUG] 模型名称: {ModelName}")
-print(f"[DEBUG] 输入通道: {Inchannels}")
-print(f"[DEBUG] 设备: {Device}")
-print(f"[DEBUG] 批大小: {BatchSize}")
-print(f"[DEBUG] 学习率: {LearnRate}")
-print(f"[DEBUG] 训练轮数: {Epochs}")
+print(f"[DEBUG] Model name: {ModelName}")
+print(f"[DEBUG] Input channels: {Inchannels}")
+print(f"[DEBUG] Device: {Device}")
+print(f"[DEBUG] Batch size: {BatchSize}")
+print(f"[DEBUG] Learn rate: {LearnRate}")
+print(f"[DEBUG] Epochs: {Epochs}")
 
 # 确保模型保存目录存在
 if not os.path.exists(ModelsDir):
     os.makedirs(ModelsDir)
-    print(f'[MT_TRAIN] 已创建模型保存目录: {ModelsDir}')
+    print(f'[MT_TRAIN] Created models directory: {ModelsDir}')
 else:
-    print(f'[MT_TRAIN] 模型保存目录已存在: {ModelsDir}')
+    print(f'[MT_TRAIN] Models directory exists: {ModelsDir}')
 
 # 确保结果保存目录存在
 if not os.path.exists(ResultsDir):
     os.makedirs(ResultsDir)
-    print(f'[MT_TRAIN] 已创建结果保存目录: {ResultsDir}')
+    print(f'[MT_TRAIN] Created results directory: {ResultsDir}')
 else:
-    print(f'[MT_TRAIN] 结果保存目录已存在: {ResultsDir}')
+    print(f'[MT_TRAIN] Results directory exists: {ResultsDir}')
 
 # 定义训练和结果目录
 models_dir = ModelsDir  # 使用之前定义的ModelsDir
 results_dir = ResultsDir  # 使用之前定义的ResultsDir
-print(f'[DEBUG] 模型保存目录: {models_dir}')
-print(f'[DEBUG] 结果保存目录: {results_dir}')
+print(f'[DEBUG] models_dir: {models_dir}')
+print(f'[DEBUG] results_dir: {results_dir}')
 from math import log
 import subprocess
 import os
@@ -164,6 +165,8 @@ if ModelName == 'UnetModel':
     net = UnetModel(n_classes=Nclasses, in_channels=Inchannels)
 elif ModelName == 'DinkNet':
     net = DinkNet50(num_classes=Nclasses, num_channels=Inchannels)
+elif ModelName == 'UnetPlusPlus':
+    net = UNetPlusPlus(num_classes=Nclasses, num_channels=Inchannels)
 # elif ModelName == 'DUNet':
 #     net = DUNet(in_channels=Inchannels, n_classes=Nclasses)
 # elif ModelName == 'ENet':
@@ -231,28 +234,28 @@ try:
     else:
         # 如果目录不存在或模式不正确，使用默认值
         total_files = 1000
-        print(f'[MT_TRAIN WARNING] 无法访问数据目录或MT_Mode设置不正确，使用默认文件数: {total_files}')
-        print(f'[MT_TRAIN] 当前MT_Mode: {MT_Mode}')
-        print(f'[MT_TRAIN] TE_Resistivity_Dir: {TE_Resistivity_Dir} 存在: {os.path.exists(TE_Resistivity_Dir)}')
-        print(f'[MT_TRAIN] TM_Resistivity_Dir: {TM_Resistivity_Dir} 存在: {os.path.exists(TM_Resistivity_Dir)}')
+        print(f'[MT_TRAIN WARNING] Cannot access data dirs or invalid MT_Mode; using default file count: {total_files}')
+        print(f'[MT_TRAIN] Current MT_Mode: {MT_Mode}')
+        print(f'[MT_TRAIN] TE_Resistivity_Dir: {TE_Resistivity_Dir} exists: {os.path.exists(TE_Resistivity_Dir)}')
+        print(f'[MT_TRAIN] TM_Resistivity_Dir: {TM_Resistivity_Dir} exists: {os.path.exists(TM_Resistivity_Dir)}')
 except Exception as e:
     total_files = 1000
-    print(f'[MT_TRAIN ERROR] 统计文件数量时出错: {str(e)}，使用默认文件数: {total_files}')
+    print(f'[MT_TRAIN ERROR] Error counting files: {str(e)}; using default count: {total_files}')
 
 # 根据TrainSize比例计算实际训练文件个数
 # 使用round函数来处理浮点数精度问题
-print(f'[MT_TRAIN] 总文件数: {total_files}, TrainSize比例: {TrainSize}, 计算前: {total_files * TrainSize}')
+print(f'[MT_TRAIN] Total files: {total_files}, TrainSize ratio: {TrainSize}, before round: {total_files * TrainSize}')
 train_size_files = round(total_files * TrainSize)
 # 确保至少有一个训练文件
 if train_size_files < 1:
     train_size_files = 1
-print(f'[MT_TRAIN] 计算得到训练文件个数: {train_size_files}')
-print(f'[MT_TRAIN] 实际使用的训练比例: {train_size_files/total_files:.6f}')
+print(f'[MT_TRAIN] Computed training file count: {train_size_files}')
+print(f'[MT_TRAIN] Actual training fraction: {train_size_files/total_files:.6f}')
 
 # 对于测试或调试目的，限制最大文件数量
 max_train_files = 1000000  # 可以根据需要调整这个值
 if train_size_files > max_train_files:
-    print(f'[MT_TRAIN WARNING] 限制训练文件数量为 {max_train_files} 进行快速测试')
+    print(f'[MT_TRAIN WARNING] Capping train files at {max_train_files} for quick test')
     train_size_files = max_train_files
 train_set, label_set, data_dsp_dim, label_dsp_dim, valid_count = DataLoad_Train(train_size=train_size_files, train_data_dir=train_data_dir, \
                                                                  data_dim=DataDim, in_channels=Inchannels, \
@@ -263,43 +266,43 @@ train_set, label_set, data_dsp_dim, label_dsp_dim, valid_count = DataLoad_Train(
                                                                 TE_Resistivity_Dir=TE_Resistivity_Dir,TE_Phase_Dir=TE_Phase_Dir,\
                                                                 TM_Resistivity_Dir=TM_Resistivity_Dir,TM_Phase_Dir=TM_Phase_Dir,\
                                                                 Resistivity_Model_Dir=Resistivity_Model_Dir, MT_Mode=MT_Mode)
-print(f'有效的训练数据个数: {valid_count}')
+print(f'Valid training samples: {valid_count}')
 
 # 分割训练集和验证集
-print(f'[MT_TRAIN] 准备分割训练集和验证集...')
+print(f'[MT_TRAIN] Splitting train and validation...')
 # 使用ValSize参数来计算验证集比例
 # 确保导入ValSize参数
 if 'ValSize' not in dir():
     ValSize = 0.2  # 默认值
-print(f'[MT_TRAIN] 训练集大小参数(TrainSize): {round(TrainSize, 2):.2f}')
-print(f'[MT_TRAIN] 验证集大小参数(ValSize): {round(ValSize, 2):.2f}')
+print(f'[MT_TRAIN] TrainSize param: {round(TrainSize, 2):.2f}')
+print(f'[MT_TRAIN] ValSize param: {round(ValSize, 2):.2f}')
 
 # 是的，这个比例可以任意设置！现在我们直接使用ValSize参数作为验证集占已加载训练数据的比例
 # 这样用户可以通过ParamConfig.py中的ValSize参数任意设置验证集比例
 val_ratio = ValSize  # 直接使用ValSize参数作为验证集比例
-print(f'[MT_TRAIN] 验证集比例(相对于已加载的训练数据): {val_ratio:.2f}')
+print(f'[MT_TRAIN] Validation ratio (of loaded train): {val_ratio:.2f}')
 
 # 添加合理性检查
 if val_ratio <= 0 or val_ratio >= 1:
-    print(f'[MT_TRAIN WARNING] 验证集比例 {val_ratio} 不合理，将调整为0.2')
+    print(f'[MT_TRAIN WARNING] Val ratio {val_ratio} invalid; forcing 0.2')
     val_ratio = 0.2
     
 # 确保有足够的数据进行分割
 min_val_samples = 5  # 最小验证样本数
 min_val_ratio = min_val_samples / valid_count if valid_count > 0 else 0.01
 if valid_count <= 10:  # 如果有效数据太少
-    print(f'[MT_TRAIN WARNING] 有效数据量太少: {valid_count}，调整验证集比例')
+    print(f'[MT_TRAIN WARNING] Too few valid samples: {valid_count}; adjusting val ratio')
     val_ratio = min(val_ratio, 0.5)  # 最多使用一半数据作为验证集
     if val_ratio < min_val_ratio:
         val_ratio = min_val_ratio
-        print(f'[MT_TRAIN] 调整验证集比例为: {val_ratio:.6f}，确保至少有{min_val_samples}个验证样本')
+        print(f'[MT_TRAIN] Adjusted val ratio to: {val_ratio:.6f}; ensuring at least {min_val_samples} val samples')
 
 # 分割数据
 X_train, X_val, y_train, y_val = train_test_split(
     train_set, label_set, test_size=val_ratio, random_state=42, shuffle=True
 )
-print(f'[MT_TRAIN] 训练集大小: {len(X_train)}, 验证集大小: {len(X_val)}')
-print(f'[MT_TRAIN] 验证集实际占总训练数据比例: {len(X_val)/(len(X_train)+len(X_val)):.2f}')
+print(f'[MT_TRAIN] Train set size: {len(X_train)}, Val set size: {len(X_val)}')
+print(f'[MT_TRAIN] Val fraction of train+val: {len(X_val)/(len(X_train)+len(X_val)):.2f}')
 
 # Change data type (numpy --> tensor)
 # 处理多通道数据，并确保数据类型为float32以匹配模型期望
@@ -349,7 +352,7 @@ print(f'[MT_TRAIN CONFIG] Number of training samples: {len(train_loader.dataset)
 # val_losses = []  # 已在上面初始化，删除重复初始化
 # 正确计算每轮的步数：训练集样本数除以批次大小
 step = max(1, len(train_loader))  # 确保step至少为1
-print(f"[MT_TRAIN] 每轮训练步数: {step}")
+print(f"[MT_TRAIN] Steps per epoch: {step}")
 start = time.time()
 
 # 设置学习率调度器
@@ -365,9 +368,9 @@ best_val_loss = float('inf')
 best_model_path = None
 best_epoch = 0
 
-print('[DEBUG TRAIN] 即将开始epoch循环，总epoch数:', Epochs)
+print('[DEBUG TRAIN] Starting epoch loop, total epochs:', Epochs)
 for epoch in range(Epochs):
-    print(f'[DEBUG EPOCH] 真正进入epoch循环: {epoch+1}/{Epochs}')
+    print(f'[DEBUG EPOCH] Entering epoch: {epoch+1}/{Epochs}')
     print(f'[MT_TRAIN EPOCH] Starting epoch {epoch+1}/{Epochs}')
     epoch_loss = 0.0
     since = time.time()
@@ -410,7 +413,7 @@ for epoch in range(Epochs):
         
         # 检查和修复NaN或Inf值
         if torch.isnan(images).any() or torch.isinf(images).any():
-            print(f'[CRITICAL] 输入数据包含NaN或Inf值，尝试修复')
+            print(f'[CRITICAL] Input has NaN/Inf; clamping')
             images = torch.nan_to_num(images, nan=0.0, posinf=1e3, neginf=-1e3)
         
         # 标准前向传播
@@ -422,20 +425,20 @@ for epoch in range(Epochs):
             
             # 检查输出是否包含NaN或Inf
             if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                print(f'[CRITICAL] 模型输出包含NaN或Inf值，尝试修复')
+                print(f'[CRITICAL] Output has NaN/Inf; clamping')
                 outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1e-1, neginf=-1e-1)
             
             # 计算损失
             loss1 = F.mse_loss(outputs, labels, reduction='sum') / (label_dsp_dim[0] * label_dsp_dim[1] * actual_batch_size)
             loss = loss1
         except Exception as e:
-            print(f'[EXCEPTION] 前向传播异常: {str(e)}，跳过此批次')
+            print(f'[EXCEPTION] Forward error: {str(e)}; skip batch')
             optimizer.zero_grad()
             continue
         
         # 检查损失值
         if np.isnan(float(loss.item())) or np.isinf(float(loss.item())):
-            print(f'[CRITICAL ERROR] 检测到NaN/Inf损失值: {loss.item()}')
+            print(f'[CRITICAL ERROR] NaN/Inf loss: {loss.item()}')
             optimizer.zero_grad()
             continue
         
@@ -445,7 +448,7 @@ for epoch in range(Epochs):
             # 标准反向传播
             loss.backward()
         except Exception as e:
-            print(f'[EXCEPTION] 反向传播异常: {str(e)}，跳过此批次')
+            print(f'[EXCEPTION] Backward error: {str(e)}; skip batch')
             optimizer.zero_grad()
             continue
         
@@ -463,7 +466,7 @@ for epoch in range(Epochs):
         
         # 确保反向传播成功
         if torch.isnan(loss).any() or torch.isinf(loss).any():
-            print(f'[CRITICAL ERROR] 损失值包含NaN或Inf: {loss.item()}')
+            print(f'[CRITICAL ERROR] Loss is NaN/Inf: {loss.item()}')
             raise ValueError('Loss contains NaN or Inf')
 
         # 优化器更新
@@ -472,7 +475,7 @@ for epoch in range(Epochs):
         with torch.no_grad():
             param_check = next(net.parameters())
             if torch.isnan(param_check).any():
-                print('[CRITICAL ERROR] 优化器更新后参数包含NaN')
+                print('[CRITICAL ERROR] NaN in params after optimizer')
                 raise ValueError('Parameters contain NaN after optimization')
         
         # 学习率调度器逻辑
@@ -491,7 +494,7 @@ for epoch in range(Epochs):
                                                                                     step * Epochs, loss.item()))
         
     # Epoch完成后打印信息 - 已移到batch循环外部
-    print('[DEBUG TRAIN] Batch循环已完成，开始处理epoch完成逻辑')
+    print('[DEBUG TRAIN] Batch loop done; epoch finalize')
     print('Epoch: {:d} finished ! Loss: {:.8f}'.format(epoch + 1, epoch_loss / len(train_loader)))
     # loss3 = np.append(loss3, epoch_loss / len(train_loader))  # 使用np.append会将列表转换为numpy数组
     loss3.append(epoch_loss / len(train_loader))  # 保持与val_losses一致，使用列表append
@@ -546,10 +549,10 @@ for epoch in range(Epochs):
         
         # 保存新的最佳模型
         torch.save(net.state_dict(), best_model_path)
-        print(f'[MT_TRAIN SAVE] 新的最佳模型已保存到 {best_model_path}, 验证损失: {best_val_loss:.8f}')
+        print(f'[MT_TRAIN SAVE] Saved best model to {best_model_path}, val loss: {best_val_loss:.8f}')
         
         # 根据用户要求，不保存归一化参数
-        print(f'[MT_TRAIN SAVE] 最佳模型已保存，不使用归一化参数')
+        print(f'[MT_TRAIN SAVE] Best model saved (no norm params)')
         
 
 # Record the consuming time
@@ -567,17 +570,17 @@ torch.save(net.state_dict(), final_model_path)
 print(f'[MT_TRAIN COMPLETE] Final model saved to {final_model_path}')
 
 # 显示最佳模型信息
-print('[DEBUG TRAIN] 训练循环已完成，实际执行的epoch数:', epoch+1)
-print(f'[MT_TRAIN SUMMARY] 最佳模型在第{best_epoch}轮保存，验证损失: {best_val_loss:.8f}')
+print('[DEBUG TRAIN] Training done; epochs executed:', epoch+1)
+print(f'[MT_TRAIN SUMMARY] Best model at epoch {best_epoch} saved, val loss: {best_val_loss:.8f}')
 if best_model_path:
-    print(f'[MT_TRAIN SUMMARY] 最佳模型路径: {best_model_path}')
+    print(f'[MT_TRAIN SUMMARY] Best model path: {best_model_path}')
     # 将最佳模型复制为best.pkl，便于后续使用
     best_pkl_path = models_dir + f'{ModelName}_best.pkl'
     if os.path.exists(best_pkl_path):
         os.remove(best_pkl_path)
     import shutil
     shutil.copy(best_model_path, best_pkl_path)
-    print(f'[MT_TRAIN SUMMARY] 最佳模型已复制为: {best_pkl_path}')
+    print(f'[MT_TRAIN SUMMARY] Best model copied to: {best_pkl_path}')
 
 # 保存训练和验证损失曲线
 # print('[MT_TRAIN RESULTS] 保存训练和验证损失曲线...')

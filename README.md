@@ -1,3 +1,210 @@
+# MTDLPy - 大地电磁深度学习反演系统
+
+MTDLPy 是一个面向大地电磁（MT）数据的深度学习反演工具，提供 **GUI 图形界面 + 命令行脚本** 两种工作方式，支持：
+
+- TE 模式
+- TM 模式
+- TE+TM 联合（Both）模式
+
+当前版本以 `MTDLPy_GUI.py`、`MT_train.py`、`MT_test.py` 为核心流程。
+
+---
+
+## 1. 主要功能
+
+- **数据导入与可视化**：在 GUI 中导入 TE/TM 视电阻率、相位、标签（电阻率模型）数据目录，并支持右键可视化。
+- **参数配置**：选择模型（`UnetModel`、`DinkNet`、`UnetPlusPlus`），配置 Batch Size、Learning Rate、Train/Validation 比例、Epoch 等。
+- **模型训练**：GUI 启动训练时调用 `MT_train.py`，支持训练进度、日志、损失曲线显示，自动保存最佳模型与最终模型。
+- **模型预测**：GUI 调用 `MT_test.py` 进行预测，支持根据模型文件自动识别输入通道（2 通道或 4 通道）与模式兼容性检查。
+- **结果导出**：预测结果可导出为 `*.dat`（pyGIMLI 兼容）、`*.grd`（Surfer Grid）、`*.txt`。
+- **快速环境检测**：`quick_test.py` 可快速检查 Python、PyTorch、PyQt5 及配置模块是否可用。
+
+---
+
+## 2. 项目结构（当前常用）
+
+```text
+dl/
+├── MTDLPy_GUI.py          # GUI 主程序（数据导入/参数配置/训练/预测）
+├── MT_train.py            # 训练入口脚本
+├── MT_test.py             # 预测入口脚本
+├── quick_test.py          # 环境快速检测
+├── test_prediction.py     # 简化预测测试脚本
+├── ml_trainer.py          # GUI 训练线程与训练日志解析
+├── ParamConfig.py         # 训练/数据/路径参数（核心配置）
+├── PathConfig.py          # 路径与模型命名相关配置
+├── LibConfig.py           # 公共依赖导入
+├── requirements.txt       # 依赖列表
+├── models/                # 模型输出目录（自动创建）
+├── results/               # 结果输出目录（自动创建）
+└── func/
+    ├── DataLoad_Train.py  # 训练数据加载
+    ├── DataLoad_Test.py   # 测试数据加载（旧流程）
+    ├── dinknet.py
+    ├── UnetModel.py
+    └── unetplusplus.py
+```
+
+---
+
+## 3. 环境要求
+
+- Python >= 3.7
+- Windows（当前 GUI 与路径默认配置以 Windows 为主）
+- 建议使用虚拟环境
+
+---
+
+## 4. 安装依赖
+
+推荐：
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` 主要包括：
+
+- PyQt5
+- numpy / scipy / pandas / scikit-learn
+- matplotlib
+- opencv-python / scikit-image
+- torch / torchvision
+
+---
+
+## 5. 快速自检
+
+在项目根目录运行：
+
+```bash
+python quick_test.py
+```
+
+通过后再启动 GUI 或命令行流程。
+
+---
+
+## 6. GUI 使用流程（推荐）
+
+启动：
+
+```bash
+python MTDLPy_GUI.py
+```
+
+GUI 主要有 4 个标签页：
+
+1. **Data Import**
+   - 选择模式：TE / TM / Both
+   - 导入输入数据目录（视电阻率、相位）与标签目录（电阻率模型）
+   - 要求各目录文件数匹配（按模式规则检查）
+2. **Param Config**
+   - 模型：`UnetModel` / `DinkNet` / `UnetPlusPlus`
+   - 参数：`BatchSize`、`LearningRate`、`TrainSize`、`ValSize`、`Epochs`、`Optimizer`
+3. **Model Training**
+   - 开始/暂停/继续/停止训练
+   - 实时查看训练日志、进度与损失曲线
+4. **Model Prediction**
+   - 导入预测输入文件和模型文件（`.pkl/.pt/.pth`）
+   - 调用 `MT_test.py` 生成结果
+   - 导出反演结果与剖面图
+
+---
+
+## 7. 命令行使用
+
+### 7.1 训练
+
+```bash
+python MT_train.py
+```
+
+训练参数主要来自 `ParamConfig.py`（如 `Epochs`、`BatchSize`、`LearnRate`、`MT_Mode` 等）。
+
+### 7.2 预测
+
+```bash
+python MT_test.py <test_data_file> <model_file> <MT_mode>
+```
+
+示例：
+
+```bash
+python MT_test.py H:/sdzl/2.txt models/DinkNet_best.pkl TM
+```
+
+也可使用简化脚本：
+
+```bash
+python test_prediction.py [model_path] [file_number] [mt_mode]
+```
+
+---
+
+## 8. 数据与命名约定（当前代码实现）
+
+训练与预测主流程默认使用 `*.txt` 数据。常见约定：
+
+- 输入数据目录中按编号文件：`1.txt`、`2.txt`、`3.txt`...
+- 标签目录中模型文件名：`zz1.txt`、`zz2.txt`、`zz3.txt`...
+- TE/TM/Both 模式下，相关目录文件数需一致（GUI 会校验）
+
+训练前处理要点：
+
+- 视电阻率会做 `log10` 转换；
+- 相位保持原值（不做 0~1 归一化）；
+- 标签（电阻率模型）也做 `log10` 转换；
+- 使用 `ParamConfig.py` 的网格参数（如 `DataDim`、`ModelDim`、`RawGridShape`）进行重采样/对齐。
+
+---
+
+## 9. 关键配置说明（`ParamConfig.py`）
+
+常用项：
+
+- `MT_Mode`：`TE` / `TM` / `Both`
+- `Inchannels`：2（TE/TM）或 4（Both）
+- `DataDim`、`ModelDim`
+- `RawGridShape`、`RawGridTransposeBeforeResize`
+- `PredictionOutputSpatialFix`
+- `TrainSize`、`ValSize`
+- `Epochs`、`BatchSize`、`LearnRate`
+- `ModelName`
+- `TE_Resistivity_Dir`、`TE_Phase_Dir`、`TM_Resistivity_Dir`、`TM_Phase_Dir`、`Resistivity_Model_Dir`
+
+> 注意：当前仓库中的部分默认路径是本地绝对路径（如 `H:/...`、`M:/...`）。在你的机器上使用前，请先改成实际可访问目录。
+
+---
+
+## 10. 输出结果
+
+- 模型文件：默认输出到 `models/`
+  - 最佳验证集模型（`...best_val_epochX.pkl`）
+  - 最终模型（`...final.pkl`）
+  - 便捷副本（如 `DinkNet_best.pkl`）
+- 预测结果：默认输出到 `results/`
+  - 预测结果文本（包含时间戳）
+  - 配置记录 JSON
+
+---
+
+## 11. 常见问题
+
+- **Q：训练报找不到数据目录？**  
+  A：先检查 `ParamConfig.py` 中数据目录路径，并确认目录下有对应编号的 `*.txt` 文件。
+
+- **Q：预测时模式不匹配？**  
+  A：2 通道模型只能用于 TE/TM；4 通道模型用于 Both。建议通过模型文件名中的 `ModeTE/ModeTM/ModeBoth` 区分。
+
+- **Q：结果方向看起来有旋转/转置问题？**  
+  A：调整 `PredictionOutputSpatialFix`（`none` / `transpose` / `rot90_cw` / `rot90_ccw`）后重新预测。
+
+---
+
+## 12. License
+
+本项目采用 [MIT License](LICENSE)。
 # MTDLPy - Magnetotelluric Deep Learning System
 
 ## Why Use This Code?
@@ -30,14 +237,6 @@ The MTDLPy system adopts a three-tier architecture design:
 - **Professional Model Support**: Deep learning models optimized for magnetotelluric data characteristics
 - **Real-time Monitoring**: Real-time monitoring of training process and loss curve display
 - **Multi-mode Support**: Support for TE mode, TM mode, and simultaneous processing of TE and TM modes
-
-## Pre-trained Model Download
-
-The pre-trained DinkNet model (optimized for MT data inversion) can be downloaded via the following link:
-- File name: DinkNet_best.pkl
-- Baidu Netdisk link: https://pan.baidu.com/s/1sCoV5IiYiNM4chC9h9ufIA 
-- Extraction code: MTDL
-
 
 ## Installation Guide
 

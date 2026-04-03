@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Machine Learning Trainer Module
-独立的机器学习训练模块，用于MTDLPy系统
+Machine Learning Trainer Module for MTDLPy.
 
 Author: AI Assistant
 Creation Time: 2024
@@ -56,7 +55,7 @@ plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 # 定义一个函数来检查CUDA是否可用，而不是在模块导入时自动执行
 def get_available_device(verbose=False):
-    """获取可用的计算设备，如果有GPU则使用GPU，否则使用CPU"""
+    """Return cuda if available, else cpu."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if verbose:
         print(f"Using device: {device}")
@@ -66,7 +65,7 @@ def get_available_device(verbose=False):
 DEVICE = get_available_device(verbose=False)
 
 class MTDataSet(Dataset):
-    """Magnetotelluric Data Set类，用于加载和处理MT数据"""
+    """MT dataset: load input/label files."""
     def __init__(self, input_files, label_files):
         self.input_files = input_files
         self.label_files = label_files
@@ -110,7 +109,7 @@ class MTDataSet(Dataset):
 
 
 class BaseModel(nn.Module):
-    """基础模型类，所有模型的父类"""
+    """Base model class."""
     def __init__(self, in_channels=1, out_channels=1):
         super(BaseModel, self).__init__()
         self.in_channels = in_channels
@@ -120,7 +119,7 @@ class BaseModel(nn.Module):
         raise NotImplementedError("Subclass must implement forward method")
 
 class DinkNet50(BaseModel):
-    """DinkNet50模型实现"""
+    """DinkNet50 stub."""
     def __init__(self, in_channels=1, out_channels=1, num_classes=1):
         super(DinkNet50, self).__init__(in_channels, out_channels)
         self.num_classes = num_classes
@@ -150,7 +149,7 @@ class DinkNet50(BaseModel):
         return x
 
 class UNetModel(BaseModel):
-    """U-Net模型实现"""
+    """U-Net stub."""
     def __init__(self, in_channels=1, out_channels=1):
         super(UNetModel, self).__init__(in_channels, out_channels)
         
@@ -187,7 +186,7 @@ class UNetModel(BaseModel):
         return x
 
 class MTTrainer:
-    """Magnetotelluric Trainer类，负责模型的训练过程"""
+    """Trainer: spawns MT_train.py subprocess."""
     def __init__(self, model_name='DinkNet50', in_channels=1, out_channels=1, device=None, verbose=False):
         self.model_name = model_name
         self.in_channels = in_channels
@@ -239,11 +238,14 @@ class MTTrainer:
         self.results_dir = "results/"
     
     def _create_model(self):
-        """根据模型名称创建对应的模型实例"""
+        """Create model instance by name."""
         if self.model_name == 'DinkNet50':
             model = DinkNet50(self.in_channels, self.out_channels)
         elif self.model_name == 'UNet':
             model = UNetModel(self.in_channels, self.out_channels)
+        elif self.model_name == 'UnetPlusPlus':
+            from func.unetplusplus import UNetPlusPlus
+            model = UNetPlusPlus(num_classes=self.out_channels, num_channels=self.in_channels)
         else:
             raise ValueError(f"Unsupported model name: {self.model_name}")
         
@@ -252,7 +254,7 @@ class MTTrainer:
     def set_params(self, epochs=None, batch_size=None, learning_rate=None, early_stop=None, save_epoch=None, display_step=None,
                    
                    input_files=None, label_files=None, models_dir=None, results_dir=None):
-        """设置训练参数"""
+        """Set training hyperparameters."""
         if epochs is not None:
             self.epochs = epochs
         if batch_size is not None:
@@ -281,19 +283,19 @@ class MTTrainer:
             self.results_dir = results_dir
     
     def set_callbacks(self, update_callback=None, progress_callback=None, loss_callback=None):
-        """设置回调函数，用于更新UI"""
+        """Register UI callbacks."""
         self.update_callback = update_callback
         self.progress_callback = progress_callback
         self.loss_callback = loss_callback
     
     def _log(self, message):
-        """记录日志信息"""
+        """Append log line."""
         if self.update_callback:
             self.update_callback(message)
         print(message)
     
     def load_data(self):
-        """加载训练数据"""
+        """Load training data into DataLoader."""
         try:
             # 检查是否有输入文件和标签文件
             if not self.input_files or not self.label_files:
@@ -329,7 +331,7 @@ class MTTrainer:
             return False
     
     def load_pretrained_model(self, model_path):
-        """加载预训练模型"""
+        """Load pretrained weights if path given."""
         if os.path.exists(model_path):
             try:
                 self.model.load_state_dict(torch.load(model_path, map_location=self.device))
@@ -345,7 +347,7 @@ class MTTrainer:
     # 物理约束损失方法已移除
     
     def save_model(self, save_path, epoch=None):
-        """保存模型"""
+        """Save state_dict to disk."""
         try:
             # 确保保存目录存在
             save_dir = os.path.dirname(save_path)
@@ -366,7 +368,7 @@ class MTTrainer:
             return False
     
     def _train_in_thread(self):
-        """在单独的线程中执行训练过程"""
+        """Run MT_train.py in a background thread."""
         try:
             import subprocess
             import sys
@@ -375,19 +377,19 @@ class MTTrainer:
             # 确保模型保存目录存在
             if not os.path.exists(self.models_dir):
                 os.makedirs(self.models_dir)
-                self._log(f"已创建模型保存目录: {self.models_dir}")
+                self._log(f"Created models directory: {self.models_dir}")
             else:
-                self._log(f"模型保存目录已存在: {self.models_dir}")
+                self._log(f"Models directory exists: {self.models_dir}")
             
             # 获取MT_train.py的绝对路径
             mt_train_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'MT_train.py')
             
-            self._log(f"正在启动MT_train.py进行训练")
-            self._log(f"MT_train.py路径: {mt_train_path}")
+            self._log(f"Starting MT_train.py")
+            self._log(f"MT_train.py path: {mt_train_path}")
             
             # 检查MT_train.py文件是否存在
             if not os.path.exists(mt_train_path):
-                self._log(f"错误: 找不到MT_train.py文件在路径 {mt_train_path}")
+                self._log(f"Error: MT_train.py not found at {mt_train_path}")
                 return
             
             # 构建命令行参数
@@ -397,14 +399,14 @@ class MTTrainer:
             if self.input_files:
                 cmd_args.extend(['--input_files'])
                 cmd_args.extend(self.input_files)
-                self._log(f"添加了 {len(self.input_files)} 个输入文件")
+                self._log(f"Added {len(self.input_files)} input files")
                 
             if self.label_files:
                 cmd_args.extend(['--label_files'])
                 cmd_args.extend(self.label_files)
-                self._log(f"添加了 {len(self.label_files)} 个标签文件")
+                self._log(f"Added {len(self.label_files)} label files")
             
-            self._log(f"执行命令: {' '.join(cmd_args)}")
+            self._log(f"Command: {' '.join(cmd_args)}")
             
             # 启动MT_train.py进程
             try:
@@ -416,9 +418,9 @@ class MTTrainer:
                     bufsize=1,
                     shell=False
                 )
-                self._log(f"MT_train.py进程已成功启动，进程ID: {process.pid}")
+                self._log(f"MT_train.py started, PID: {process.pid}")
             except Exception as proc_error:
-                self._log(f"启动MT_train.py进程失败: {str(proc_error)}")
+                self._log(f"Failed to start MT_train.py: {str(proc_error)}")
                 return
             
             # 实时读取和处理输出
@@ -443,7 +445,7 @@ class MTTrainer:
                 # 检查是否停止训练
                 if self.stopped:
                     self.was_stopped = True
-                    self._log("正在停止训练...")
+                    self._log("Stopping training...")
                     try:
                         process.terminate()
                         process.wait(timeout=5)
@@ -452,14 +454,14 @@ class MTTrainer:
                             process.kill()
                         except:
                             pass
-                    self._log("训练已停止")
+                    self._log("Training stopped")
                     return
                 
                 # 检查是否暂停训练
                 while self.paused:
                     if self.stopped:
                         self.was_stopped = True
-                        self._log("正在停止训练...")
+                        self._log("Stopping training...")
                         try:
                             process.terminate()
                             process.wait(timeout=5)
@@ -468,7 +470,7 @@ class MTTrainer:
                                 process.kill()
                             except:
                                 pass
-                        self._log("训练已停止")
+                        self._log("Training stopped")
                         return
                     time.sleep(0.5)
                 
@@ -514,7 +516,7 @@ class MTTrainer:
                                                     progress = int((epoch / self.epochs) * 100)
                                                     self.progress_callback(min(progress, 100))
                                     except Exception as e:
-                                        self._log(f"解析epoch时出错: {str(e)}")
+                                        self._log(f"Epoch parse error: {str(e)}")
                                 
                                     try:
                                         # 提取总损失值
@@ -539,9 +541,9 @@ class MTTrainer:
                                                 # 传递训练损失和验证损失
                                                 self.loss_callback(self.total_loss, self.validation_losses, [])
                                     except Exception as parse_error:
-                                        self._log(f"解析损失信息时出错: {str(parse_error)}")
+                                        self._log(f"Loss parse error: {str(parse_error)}")
                                 except Exception as general_error:
-                                    self._log(f"处理训练行时出错: {str(general_error)}")
+                                    self._log(f"Train line handler error: {str(general_error)}")
                             
                             # 解析验证损失信息 - 独立检查每一行
                             if '[MT_TRAIN VALIDATION]' in line:
@@ -557,9 +559,9 @@ class MTTrainer:
                                     if self.loss_callback:
                                         self.loss_callback(self.total_loss, self.validation_losses, [])
                                 except (IndexError, ValueError):
-                                    self._log(f"解析验证损失信息时出错: {line}")
+                                    self._log(f"Val loss parse error: {line}")
                                 except Exception as val_error:
-                                    self._log(f"处理验证行时出错: {str(val_error)}")
+                                    self._log(f"Val line handler error: {str(val_error)}")
                         
                         # 创建并启动GUI更新线程
                         gui_thread = threading.Thread(target=update_gui)
@@ -570,15 +572,15 @@ class MTTrainer:
                 current_time = time.time()
                 if output_received and current_time - last_output_time > 10:
                     def log_warning():
-                        self._log("警告: 长时间没有输出，请检查MT_train.py的执行情况")
+                        self._log("Warning: no output for a while; check MT_train.py")
                     warning_thread = threading.Thread(target=log_warning)
                     warning_thread.daemon = True
                     warning_thread.start()
                     last_output_time = current_time
                 elif not output_received and current_time - start_time > 10:
                     def log_startup_warning():
-                        self._log("警告: MT_train.py进程启动后10秒内没有收到输出")
-                        self._log("请检查MT_train.py文件是否能够正常执行")
+                        self._log("Warning: no output from MT_train.py within 10s of start")
+                        self._log("Check that MT_train.py runs correctly")
                     startup_warning_thread = threading.Thread(target=log_startup_warning)
                     startup_warning_thread.daemon = True
                     startup_warning_thread.start()
@@ -590,34 +592,34 @@ class MTTrainer:
             # 训练完成处理
             total_time_elapsed = time.time() - start_time
             self.was_stopped = False  # 无论返回代码如何，都设置为训练完成
-            self._log(f"训练进程已结束，耗时 {total_time_elapsed // 60:.0f}m {total_time_elapsed % 60:.0f}s")
-            self._log(f"MT_train.py返回代码: {process.returncode}")
+            self._log(f"Training process ended, elapsed {total_time_elapsed // 60:.0f}m {total_time_elapsed % 60:.0f}s")
+            self._log(f"MT_train.py exit code: {process.returncode}")
             
             # 检查是否收到任何输出
             if not output_received:
-                self._log("警告: 整个训练过程中没有收到MT_train.py的任何输出")
-                self._log("可能的原因:")
-                self._log("1. MT_train.py文件路径不正确")
-                self._log("2. Python解释器路径不正确")
-                self._log("3. MT_train.py执行时出现严重错误")
-                self._log("4. 输入参数格式不正确")
+                self._log("Warning: no stdout from MT_train.py during run")
+                self._log("Possible causes:")
+                self._log("1. Wrong path to MT_train.py")
+                self._log("2. Wrong Python interpreter")
+                self._log("3. MT_train.py crashed early")
+                self._log("4. Invalid CLI arguments")
             
             # 只在真正训练完成时才设置进度条为100%
             if self.progress_callback and training_completed:
                 self.progress_callback(100)
             
         except Exception as e:
-            self._log(f"启动MT_train.py时发生错误: {str(e)}")
-            self._log(f"请检查MT_train.py文件是否存在且可执行")
+            self._log(f"Error launching MT_train.py: {str(e)}")
+            self._log("Check MT_train.py exists and is executable")
             import traceback
-            self._log(f"错误详情: {traceback.format_exc()}")
+            self._log(f"Traceback: {traceback.format_exc()}")
             self.was_stopped = False
     
     def train(self):
-        """执行训练过程 - 在单独的线程中调用MT_train.py进行训练"""
+        """Start MT_train.py on a worker thread."""
         # 如果已经在训练中，不重复启动
         if self.train_thread and self.train_thread.is_alive():
-            self._log("训练已经在进行中")
+            self._log("Training already in progress")
             return False
             
         # 重置状态标志
@@ -630,52 +632,52 @@ class MTTrainer:
         self.train_thread.daemon = True  # 设置为守护线程，主线程结束时自动终止
         self.train_thread.start()
         
-        self._log("训练已在单独线程中启动")
+        self._log("Training thread started")
         return True
     
     def pause_train(self):
-        """暂停训练"""
+        """Pause training."""
         if self.train_thread and self.train_thread.is_alive() and not self.paused:
             self.paused = True
-            self._log("训练已暂停")
+            self._log("Training paused")
             return True
         return False
     
     def resume_train(self):
-        """恢复训练"""
+        """Resume training."""
         if self.paused:
             self.paused = False
-            self._log("训练已恢复")
+            self._log("Training resumed")
             return True
         return False
     
     def stop_train(self):
-        """停止训练"""
+        """Stop training."""
         if self.train_thread and self.train_thread.is_alive():
             self.stopped = True
             # 设置paused为False，确保训练线程可以继续执行并检测到stopped标志
             self.paused = False
             # 等待训练线程结束，最多等待10秒
             self.train_thread.join(timeout=10)
-            self._log("训练已停止")
+            self._log("Training stopped")
             return True
         return False
     
     def is_training(self):
-        """检查训练是否正在进行中"""
+        """Return True if worker thread is alive."""
         return self.train_thread is not None and self.train_thread.is_alive()
 
     
     def pause(self):
-        """暂停训练"""
+        """Set paused flag."""
         self.paused = True
     
     def resume(self):
-        """恢复训练"""
+        """Clear paused flag."""
         self.paused = False
     
     def stop(self):
-        """停止训练"""
+        """Request stop."""
         self.stopped = True
         self.paused = False
 
